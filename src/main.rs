@@ -1,39 +1,28 @@
-use std::path::{Path, PathBuf};
-use std::{env, fs, io};
+use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, Write, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::error::Error;
 use std::time::Instant;
 use csv::WriterBuilder;
-use indicatif::{ProgressBar, ProgressStyle};
-use std::io::Read; // <<--- Importa Read acá
+
 
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        help();
+    if args.len() < 3 {
+        eprintln!("Usage:");
+        eprintln!("  Clean headers: csv_tool clean <input_file> <output_file>");
+        eprintln!("  Filter rows: csv_tool filter <input_file> <output_file> <column_name> <value>");
+        eprintln!("  Check for duplicate headers: csv_tool check <input_file>");
+        eprintln!("  Count csv lines: csv_tool count <input_file>");
+        eprintln!("  Show last 10 records: csv_tool tail <input_file>");
         return Ok(());
     }
 
     let command = &args[1];
 
     match command.as_str() {
-        "view" => {
-            if args.len() != 3 {
-                eprintln!("Usage: csv_tool view <input_file>");
-                return Ok(());
-            }
-
-            let cant = &args[3];
-            let result = view_data(cant);
-            lines = result?.lines;
-
-            for line in lines.iter().rev() {
-                println!("{}", line);
-            }
-        },
         "clean" => {
             if args.len() != 4 {
                 eprintln!("Usage: csv_tool clean <input_file> <output_file>");
@@ -41,6 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let input_file = &args[2];
             let output_file = &args[3];
+            println!("Cleaning headers in file: {}...", input_file);
             clean_headers(input_file, output_file)?;
         },
         "filter" => {
@@ -52,6 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let output_file = &args[3];
             let column_name = &args[4];
             let value = &args[5];
+            print!("Filtering rows in file: {}...", input_file);
             filter_rows(input_file, output_file, column_name, value)?;
         },
         "check" => {
@@ -60,7 +51,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
             let input_file = &args[2];
-            print!("Checking for duplicate headers in file: {}...", input_file);
             if has_duplicate_header(input_file)? {
                 println!("Duplicate header found.");
             } else {
@@ -72,158 +62,101 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("Usage: csv_tool count <input_file>");
                 return Ok(());
             }
-            print!("Counting lines in file: {}...", args[2]);
             let input_file = &args[2];
+            println!("Counting csv rows...");
             let line_count = count_lines(input_file)?;
             println!("Number of lines in the file: {}", line_count);
         },
-        "merge" => {
-            let args: Vec<String> = env::args().collect();
-
-    if args.len() >= 3 && args[1] == "merge" {
-        let dir = &args[2];
-        let ext = if args.len() >= 4 { &args[3] } else { "csv" };
-        if let Err(e) = merge_csv_files(dir, ext) {
-            eprintln!("❌ Error en merge: {}", e);
-            std::process::exit(1);
-        }
-         } else {
-            eprintln!("❌ Uso: csv_tools merge <directorio> [extension]");
-            std::process::exit(1);
+        "count_all" => {
+            if args.len() != 3 {
+                eprintln!("Usage: csv_tool count_all <file_list>");
+                return Ok(());
             }
+            let file_list = &args[2];
+            count_all_files(file_list)?;
         },
-        "help" => {
-            help();
+        "merge_dedup" => {
+            if args.len() != 4 {
+                eprintln!("Usage: csv_tool merge_dedup <file_list> <output_file>");
+                return Ok(());
+            }
+            let file_list = &args[2];
+            let output_file = &args[3];
+            merge_and_deduplicate(file_list, output_file)?;
         },
-        "version" => {
-            println!("CSV Tool version 0.1.0");
+        "tail" => {
+            if args.len() != 3 {
+                eprintln!("Usage: csv_tool tail <input_file>");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            println!("Showing last 10 records from file: {}...", input_file);
+            show_tail_records(input_file)?;
         },
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Valid commands are: clean, filter");
+            eprintln!("Valid commands are: clean, filter, check, count, count_all, merge_dedup, tail");
         }
     }
 
     Ok(())
 }
 
-fn view_data(cant : int) -> std::io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let path = &args[1];
-    let num_lines = if args.len() > 2 { args[2].parse::<usize>().unwrap_or(10) } else { 10 };
+fn count_all_files(file_list_path: &str) -> Result<(), Box<dyn Error>> {
+    let file = File::open(file_list_path)?;
+    let reader = BufReader::new(file);
 
-    let mut file = File::open(path)?;
-    let mut pos = file.seek(SeekFrom::End(0))?;
-    let mut buffer = [0u8; 4096];
-    let mut lines = Vec::new();
-    let mut chunk = Vec::new();
+    let mut total = 0;
 
-    while pos > 0 && lines.len() <= num_lines {
-        let read_size = if pos >= 4096 { 4096 } else { pos as usize };
-        pos = file.seek(SeekFrom::Start(pos - read_size as u64))?;
-        file.read_exact(&mut buffer[..read_size])?;
+    for line in reader.lines() {
+        let filename = line?;
+        let count = count_lines(&filename)?;
+        println!("{}: {} líneas", filename, count);
+        total += count;
+    }
 
-        for &b in buffer[..read_size].iter().rev() {
-            if b == b'\n' && !chunk.is_empty() {
-                lines.push(String::from_utf8_lossy(&chunk.iter().rev().cloned().collect::<Vec<_>>()).to_string());
-                chunk.clear();
-                if lines.len() >= num_lines {
-                    break;
+    println!("\nTotal de líneas en todos los archivos: {}", total);
+    Ok(())
+}
+
+fn merge_and_deduplicate(file_list_path: &str, output_file: &str) -> Result<(), Box<dyn Error>> {
+    use std::collections::HashSet;
+
+    let file_list = File::open(file_list_path)?;
+    let reader = BufReader::new(file_list);
+    let mut seen_lines = HashSet::new();
+    let mut writer = BufWriter::new(File::create(output_file)?);
+
+    let mut header_written = false;
+
+    for line in reader.lines() {
+        let filename = line?;
+        let input = File::open(&filename)?;
+        let file_reader = BufReader::new(input);
+
+        for (i, file_line) in file_reader.lines().enumerate() {
+            let line_content = file_line?;
+            if i == 0 {
+                if !header_written {
+                    writer.write_all(line_content.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    header_written = true;
                 }
             } else {
-                chunk.push(b);
+                if seen_lines.insert(line_content.clone()) {
+                    writer.write_all(line_content.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                }
             }
         }
     }
 
-    if !chunk.is_empty() {
-        lines.push(String::from_utf8_lossy(&chunk.iter().rev().cloned().collect::<Vec<_>>()).to_string());
-    }
-
-    Ok((lines))
-}
-
-
-fn merge_csv_files(dir: &str, extension: &str) -> io::Result<()> {
-    let output_name = format!("unificado.{}", extension.trim_start_matches('.'));
-    let abs_path = fs::canonicalize(dir)?;
-
-    let csv_files = collect_csv_files(&abs_path, extension, &output_name)?;
-
-    if csv_files.is_empty() {
-        eprintln!("⚠️ No se encontraron archivos .{} en {}", extension, abs_path.display());
-        std::process::exit(0);
-    }
-
-    let output_path = abs_path.join(&output_name);
-    println!("📄 Archivo de salida: {:?}", output_path);
-
-    let mut output = BufWriter::new(File::create(&output_path)?);
-
-    let pb = set_progress_bar(&csv_files);
-
-    let mut first = true;
-    for (i, file_path) in csv_files.iter().enumerate() {
-        pb.set_position(i as u64);
-        pb.println(format!("📥 Abriendo archivo: {:?}", file_path));
-
-        let file = File::open(file_path)?;
-        let reader = BufReader::new(file);
-        let mut total_written: u64 = 0;
-
-        for (j, line) in reader.lines().enumerate() {
-            let line = line?;
-            if j == 0 && !first {
-                continue;
-            }
-            writeln!(output, "{}", line)?;
-            total_written += line.len() as u64 + 1; // +1 por \n
-            pb.set_position(total_written);
-        }
-        first = false;
-    }
-
-    pb.finish_with_message("✅ Merge completo");
-    println!("� Archivo generado en: {}", output_path.display());
+    writer.flush()?;
+    println!("Merge completado, duplicados eliminados.");
     Ok(())
 }
 
-fn set_progress_bar(csv_files: &Vec<PathBuf>) -> ProgressBar {
-    let total_size: u64 = csv_files.iter()
-                                    .map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0))
-                                    .sum();
 
-    let pb = ProgressBar::new(total_size);
-
-    pb.set_style(
-    ProgressStyle::with_template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-        .unwrap()
-        .progress_chars("# "),
-    );
-
-    pb.set_message("🔄 Procesando");
-    pb
-}
-
-fn help() {
-    println!("Usage:");
-    println!("  View last N lines: csv_tool view <input_file> <num_lines>");
-    println!("  Clean headers:     csv_tool clean <input_file> <output_file>");
-    println!("  Filter rows:       csv_tool filter <input_file> <output_file> <column_name> <value>");
-    println!("  Check headers:     csv_tool check <input_file>");
-    println!("  Count lines:       csv_tool count <input_file>");
-    println!("  Merge CSV files:   csv_tool merge <directory> [extension]");
-    println!("  Help:              csv_tool help");
-    println!("  Version:           csv_tool version");
-    println!();
-    println!("Examples:");
-    println!("  csv_tool view ./data/input.csv 10");
-    println!("  csv_tool clean ./data/input.csv ./data/output.csv");
-    println!("  csv_tool filter ./data/input.csv ./data/output.csv column_name value");
-    println!("  csv_tool check ./data/input.csv");
-    println!("  csv_tool count ./data/input.csv");
-    println!("  csv_tool merge ./data csv");
-}
 
 fn count_lines(input_file: &str) -> Result<usize, Box<dyn Error>> {
 
@@ -240,41 +173,6 @@ fn count_lines(input_file: &str) -> Result<usize, Box<dyn Error>> {
     Ok(line_count)
 }
 
-
-pub fn collect_csv_files(abs_path: &Path, extension: &str, output_name: &str) -> io::Result<Vec<PathBuf>> {
-    println!("📂 Reading directory: {:?}", abs_path);
-
-    let expected_ext = extension.trim_start_matches('.').to_ascii_lowercase();
-    let mut csv_files = Vec::new();
-
-    for entry in fs::read_dir(&abs_path)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_file() {
-            if let Some(ext) = path.extension() {
-                let file_ext = ext.to_string_lossy().to_ascii_lowercase();
-
-                if file_ext == expected_ext {
-                    if let Some(name) = path.file_name() {
-                        let name_str = name.to_string_lossy();
-
-                        if name_str == output_name {
-                            println!("⚠️ Ignorando archivo de salida: {:?}", name_str);
-                            continue;
-                        }
-
-                        println!("--> MATCH ✅ {}", name_str);
-                        csv_files.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(csv_files)
-}
-
 fn has_duplicate_header(file_path: &str) -> Result<bool, Box<dyn Error>> {
     let file = File::open(file_path)?;
     let mut reader = BufReader::new(file);
@@ -285,18 +183,10 @@ fn has_duplicate_header(file_path: &str) -> Result<bool, Box<dyn Error>> {
         result = false; // Empty file, no duplicates
     }
 
-    let lines = reader.lines();
-
-    println!("Checking for duplicate headers in file: {}", file_path);
-
-    let pb = set_progress_bar(&vec![PathBuf::from(file_path)]);
-
     let header = first_line.trim_end().to_string();
     let mut line_number = 1;
 
-    for (i,line) in lines.enumerate() {
-        pb.set_position(i as u64);
-        pb.println(format!("📥 Abriendo archivo: {:?}", file_path));
+    for line in reader.lines() {
         line_number += 1;
         let line = line?;
         if line.trim_end() == header {
@@ -317,18 +207,13 @@ fn clean_headers(input_file: &str, output_file: &str) -> Result<(), Box<dyn Erro
     let mut first_line = String::new();
     let mut lines = reader.lines();
 
-   
     if let Some(Ok(header)) = lines.next() {
         first_line = header;
         writer.write_all(first_line.as_bytes())?;
         writer.write_all(b"\n")?;
     }
 
-    let pb = set_progress_bar(&vec![PathBuf::from(input_file)]);
-    println!("Cleaning headers in file: {}", input_file);
-
-    for (i,line) in lines.enumerate() {
-        pb.set_position(i as u64);
+    for line in lines {
         let line = line?;
         if line != first_line {
             writer.write_all(line.as_bytes())?;
@@ -364,5 +249,121 @@ fn filter_rows(input_file: &str, output_file: &str, column_name: &str, value: &s
 
     writer.flush()?;
     println!("Row filtering complete.");
+    Ok(())
+}
+
+fn show_tail_records(input_file: &str) -> Result<(), Box<dyn Error>> {
+    use std::io::{Read, Seek, SeekFrom};
+    
+    let start_time = Instant::now();
+    let mut file = File::open(input_file)?;
+    let file_size = file.metadata()?.len();
+    
+    // Para archivos muy grandes, empezamos leyendo desde cerca del final
+    let chunk_size = 64 * 1024; // 64KB chunks
+    let mut header: Option<String> = None;
+    
+    // Si el archivo es muy pequeño, leemos todo
+    if file_size <= chunk_size {
+        file.seek(SeekFrom::Start(0))?;
+        let reader = BufReader::new(&file);
+        let lines: Vec<String> = reader.lines().collect::<Result<Vec<_>, _>>()?;
+        
+        if let Some(first_line) = lines.first() {
+            header = Some(first_line.clone());
+            println!("Header: {}", first_line);
+            println!("---");
+        }
+        
+        let data_lines: Vec<&String> = lines.iter().skip(1).collect();
+        let start_idx = if data_lines.len() > 10 { data_lines.len() - 10 } else { 0 };
+        
+        for (i, line) in data_lines.iter().skip(start_idx).enumerate() {
+            println!("Record {}: {}", start_idx + i + 1, line);
+        }
+        
+        println!("\nShowing last {} records of {} total data records", 
+                data_lines.len().min(10), data_lines.len());
+        println!("Time taken: {:.3} seconds", start_time.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    
+    // Para archivos grandes, usamos una estrategia optimizada
+    let mut position = file_size.saturating_sub(chunk_size);
+    let mut buffer = Vec::new();
+    let mut all_lines = Vec::new();
+    
+    // Leemos la cabecera primero
+    file.seek(SeekFrom::Start(0))?;
+    let mut header_reader = BufReader::new(&file);
+    let mut header_line = String::new();
+    if header_reader.read_line(&mut header_line)? > 0 {
+        header = Some(header_line.trim_end().to_string());
+    }
+    
+    // Ahora leemos desde el final hacia atrás en chunks
+    loop {
+        file.seek(SeekFrom::Start(position))?;
+        buffer.clear();
+        buffer.resize(chunk_size as usize, 0);
+        
+        let bytes_read = file.read(&mut buffer)?;
+        buffer.truncate(bytes_read);
+        
+        // Convertimos a string y dividimos en líneas
+        let chunk_str = String::from_utf8_lossy(&buffer);
+        let mut lines: Vec<&str> = chunk_str.lines().collect();
+        
+        // Si no estamos al principio del archivo, la primera línea puede estar incompleta
+        if position > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+        
+        // Agregamos las líneas al principio de nuestro vector
+        for line in lines.iter().rev() {
+            if !line.trim().is_empty() {
+                all_lines.insert(0, line.to_string());
+                
+                // Si tenemos suficientes líneas de datos, podemos parar
+                if all_lines.len() >= 11 { // 10 + algún margen
+                    break;
+                }
+            }
+        }
+        
+        if position == 0 || all_lines.len() >= 15 {
+            break;
+        }
+        
+        position = position.saturating_sub(chunk_size);
+    }
+    
+    // Mostramos la cabecera
+    if let Some(h) = &header {
+        println!("Header: {}", h);
+        println!("---");
+    }
+    
+    // Filtramos líneas que no sean la cabecera y mostramos las últimas 10
+    let data_lines: Vec<String> = all_lines.into_iter()
+        .filter(|line| {
+            if let Some(ref h) = header {
+                line.trim() != h.trim() && !line.trim().is_empty()
+            } else {
+                !line.trim().is_empty()
+            }
+        })
+        .collect();
+    
+    let start_idx = if data_lines.len() > 10 { data_lines.len() - 10 } else { 0 };
+    let last_records: Vec<&String> = data_lines.iter().skip(start_idx).collect();
+    
+    for (i, record) in last_records.iter().enumerate() {
+        println!("Record {}: {}", start_idx + i + 1, record);
+    }
+    
+    println!("\nShowing last {} records (optimized for large files)", last_records.len());
+    println!("Time taken: {:.3} seconds", start_time.elapsed().as_secs_f64());
+    
     Ok(())
 }
