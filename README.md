@@ -4,7 +4,7 @@
 
 ## 📋 Descripción
 
-CSV Tools es una colección de herramientas desarrolladas en **Rust** y **Python** para el procesamiento eficiente de archivos CSV de gran tamaño, especialmente diseñadas para el sistema SIISA (Sistema Integral de Información de Situación de Aportes).
+CSV Tools es una colección de herramientas desarrolladas en **Rust** y **Python** para el procesamiento eficiente de archivos CSV de gran tamaño.
 
 ## 🚀 Características Principales
 
@@ -22,7 +22,7 @@ CSV Tools es una colección de herramientas desarrolladas en **Rust** y **Python
 csv_tools/
 ├── src/
 │   ├── main.rs                    # Herramienta principal en Rust
-│   ├── decoder.rs                 # Decodificador de formatos SIISA
+│   ├── decoder.rs                 # Decodificador de formatos personalizados.
 │   └── analyzer.rs                # Analizador de estructuras de datos
 ├── csv_tools.py                   # Herramienta Python con Polars
 ├── Cargo.toml                     # Configuración Rust
@@ -151,28 +151,7 @@ python csv_tools.py count input.csv
 python csv_tools.py merge_dedup file_list.txt output.csv
 ```
 
-### 3. 🔄 **Conversor SIISA V3 → V4**
-
 ## 🎯 Casos de Uso Específicos
-
-### Procesamiento de Archivos Chunk de SIISA
-
-```bash
-# 1. Analizar integridad de chunks exportados
-./target/release/csv_tools.exe check chunk_001.csv
-
-# 2. Contar registros en todos los chunks
-echo "chunk_001.csv" > chunks_list.txt
-echo "chunk_002.csv" >> chunks_list.txt
-echo "chunk_003.csv" >> chunks_list.txt
-./target/release/csv_tools.exe count_all chunks_list.txt
-
-# 3. Merge y deduplicación de chunks
-./target/release/csv_tools.exe merge_dedup chunks_list.txt merged_siisa.csv
-
-# 4. Convertir formato V3 a V4
-python convert_siisa_v3_to_v4.py merged_siisa.csv merged_siisa_v4.csv
-```
 
 ### Análisis de Calidad de Datos
 
@@ -258,13 +237,6 @@ pip install polars
 # Usar herramientas Rust en lugar de Python
 ./target/release/csv_tools.exe count huge_file.csv
 ```
-
-### Contacto
-
-- **Equipo**: SiisaRestApi Development Team
-- **Repositorio**: https://github.com/SIISAPosta/SiisaRestApi
-- **Branch**: feature/migracion_etapa1
-
 ---
 
-**⚡ Optimizado para el procesamiento de millones de registros del sistema SIISA**
+**⚡ Optimizado para el procesamiento de millones de registros**
