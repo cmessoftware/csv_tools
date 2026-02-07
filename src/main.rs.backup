@@ -1,0 +1,1970 @@
+use std::env;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::error::Error;
+use std::time::{Instant, Duration};
+use csv::WriterBuilder;
+use chrono::{DateTime, NaiveDateTime}; // add chron o import near top
+
+// Importar módulos locales
+mod progress;
+mod file_utils;
+mod models;
+
+use progress::ProgressTracker;
+use file_utils::estimate_total_lines_from_list;
+use models::MorososTransmitDynamoDbModel;
+
+fn validate_csv_schema_with_model_progress(
+    input_file: &str,
+    error_file: &str,
+    max_errors_to_show: usize,
+    cancel_on_max_errors: bool,
+) -> Result<(), Box<dyn Error>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, BufWriter, Write};
+    use std::time::{Instant, Duration};
+    use csv::StringRecord;
+
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+
+    let mut lines = reader.lines();
+    let header_line = match lines.next() {
+        Some(Ok(h)) => h,
+        _ => return Err("Archivo vacío o sin header".into()),
+    };
+    let expected_len = header_line.split(',').count();
+
+    let mut error_writer = BufWriter::new(File::create(error_file)?);
+    let mut line_number = 2;
+    let mut error_count = 0;
+    let mut processed = 0;
+    let mut shown_errors = 0;
+
+    // Para la barra de progreso, estimar total de líneas
+    let total_lines = count_lines(input_file)? - 1;
+    let start = Instant::now();
+
+    println!("Validando {} registros...", total_lines);
+
+    for line in lines {
+        let line = line?;
+        let csv_line = line.clone();
+        let record = StringRecord::from(line.split(',').collect::<Vec<_>>());
+
+        if record.len() != expected_len {
+            let msg = format!(
+                "Error en línea {}: cantidad de columnas {} (esperado: {})\n",
+                line_number,
+                record.len(),
+                expected_len
+            );
+            if shown_errors < max_errors_to_show {
+                print!("{}", msg);
+                println!("Registro CSV con error:\n{}", csv_line);
+                shown_errors += 1;
+            }
+            error_writer.write_all(msg.as_bytes())?;
+            error_writer.write_all(csv_line.as_bytes())?;
+            error_writer.write_all(b"\n")?;
+            error_count += 1;
+            if cancel_on_max_errors && shown_errors >= max_errors_to_show {
+                println!("\nSe alcanzó el máximo de errores a mostrar ({}). Cancelando validación.", max_errors_to_show);
+                break;
+            }
+        } else {
+            // Intentar deserializar solo si la longitud es correcta
+            let deser_result = record.deserialize::<MorososTransmitDynamoDbModel>(None);
+            if let Err(e) = deser_result {
+                let msg = format!("Error en línea {}: {}\n", line_number, e);
+                if shown_errors < max_errors_to_show {
+                    print!("{}", msg);
+                    println!("Registro CSV con error:\n{}", csv_line);
+                    shown_errors += 1;
+                }
+                error_writer.write_all(msg.as_bytes())?;
+                error_writer.write_all(csv_line.as_bytes())?;
+                error_writer.write_all(b"\n")?;
+                error_count += 1;
+                if cancel_on_max_errors && shown_errors >= max_errors_to_show {
+                    println!("\nSe alcanzó el máximo de errores a mostrar ({}). Cancelando validación.", max_errors_to_show);
+                    break;
+                }
+            }
+        }
+        processed += 1;
+        line_number += 1;
+
+        // Actualiza la barra de progreso cada 1000 registros o al final
+        if processed % 1000 == 0 || processed == total_lines {
+            let elapsed = start.elapsed();
+            let percent = (processed as f64 / total_lines.max(1) as f64) * 100.0;
+            let speed = processed as f64 / elapsed.as_secs_f64().max(0.01);
+            let remaining = if speed > 0.0 {
+                Duration::from_secs_f64((total_lines.saturating_sub(processed) as f64 / speed).max(0.0))
+            } else {
+                Duration::from_secs(0)
+            };
+            print!(
+                "\r[{:6.2}%] {}/{} | errores: {} | tiempo: {:.0?} | ETA: {:.0?}    ",
+                percent,
+                processed,
+                total_lines,
+                error_count,
+                elapsed,
+                remaining
+            );
+            std::io::stdout().flush().ok();
+        }
+    }
+
+    println!("\nValidación completada. Total de errores: {}. Detalles en '{}'", error_count, error_file);
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 3 {
+        help();
+        return Ok(());
+    }
+
+    let command = &args[1];
+
+    match command.as_str() {
+        "clean" => {
+            if args.len() != 4 {
+                eprintln!("Usage: csv_tool clean <input_file> <output_file>");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let output_file = &args[3];
+            println!("Cleaning headers in file: {}...", input_file);
+            clean_headers(input_file, output_file)?;
+        },
+        "filter" => {
+            if args.len() != 6 {
+                eprintln!("Usage: csv_tool filter <input_file> <output_file> <column_name> <value>");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let output_file = &args[3];
+            let column_name = &args[4];
+            let value = &args[5];
+            print!("Filtering rows in file: {}...", input_file);
+            filter_rows(input_file, output_file, column_name, value)?;
+        },
+        "check" => {
+            if args.len() < 3 {
+                eprintln!("Usage: csv_tool check <input_file> [model_type]");
+                eprintln!("  model_type: Optional, e.g., 'siisa_morosos' for specific header validation");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let model_type = args.get(3).map(|s| s.as_str());
+            enhanced_check(input_file, model_type)?;
+        },
+        "count" => {
+            if args.len() != 3 {
+                eprintln!("Usage: csv_tool count <input_file>");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            println!("Counting csv rows...");
+            let line_count = count_lines(input_file)?;
+            println!("Number of lines in the file: {}", line_count);
+        },
+        "count_all" => {
+            if args.len() != 3 {
+                eprintln!("Usage: csv_tool count_all <file_list>");
+                return Ok(());
+            }
+            let file_list = &args[2];
+            count_all_files(file_list)?;
+        },
+        "count_unique" => {
+            if args.len() != 3 {
+                eprintln!("Usage: csv_tool count_unique <file_list>");
+                return Ok(());
+            }
+            let file_list = &args[2];
+            count_unique_records(file_list)?;
+        },
+        "merge_dedup" => {
+            if args.len() != 4 {
+                eprintln!("Usage: csv_tool merge_dedup <file_list> <output_file>");
+                return Ok(());
+            }
+            let file_list = &args[2];
+            let output_file = &args[3];
+            merge_and_deduplicate(file_list, output_file)?;
+        },
+        "external_dedup" => {
+            if args.len() != 4 {
+                eprintln!("Usage: csv_tool external_dedup <file_list> <output_file>");
+                return Ok(());
+            }
+            let file_list = &args[2];
+            let output_file = &args[3];
+            external_merge_dedup(file_list, output_file)?;
+        },
+        "estimate_memory" => {
+            if args.len() != 3 {
+                eprintln!("Usage: csv_tool estimate_memory <file_list>");
+                return Ok(());
+            }
+            let file_list = &args[2];
+            estimate_memory_usage(file_list)?;
+        },
+        "compare" => {
+            if args.len() != 5 {
+                eprintln!("Usage: csv_tool compare <file1> <file2> <num_rows>");
+                return Ok(());
+            }
+            let file1 = &args[2];
+            let file2 = &args[3];
+            let num_rows: usize = args[4].parse().unwrap_or(100);
+            compare_first_n(file1, file2, num_rows)?;
+        },
+        "tail" => {
+            if args.len() != 4 {
+                eprintln!("Usage: csv_tool tail <input_file> <num_rows>");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let num_rows: usize = args[3].parse().unwrap_or(10);
+            tail_csv(input_file, num_rows)?;
+        },
+        "help" => {
+            help();
+        },
+        "merge" => {
+            if args.len() != 4 {
+                eprintln!("Usage: csv_tool merge <file_list> <output_file>");
+                return Ok(());
+            }
+            let file_list = &args[2];
+            let output_file = &args[3];
+            merge_files(file_list, output_file)?;
+        },
+        "validate_model" => {
+            if args.len() != 7 {
+                eprintln!("Usage: csv_tool validate_model <input_file> <error_file> <dynamo_table> <max_errors_to_show> <cancel_on_max_errors>");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let error_file = &args[3];
+            let table = &args[4];
+            let max_errors_to_show: usize = args[5].parse().unwrap_or(10);
+            let cancel_on_max_errors: bool = args[6].parse().unwrap_or(false);
+            match table.as_str() {
+                "siisa_morosos" => {
+                    validate_csv_schema_with_model_progress(input_file, error_file, max_errors_to_show, cancel_on_max_errors)?;
+                }
+                // Agrega aquí otros modelos si es necesario
+                _ => {
+                    eprintln!("Unknown DynamoDB table/model: {}", table);
+                }
+            }
+        },
+        "clean_invalid_lines" => {
+            if args.len() != 5 {
+                eprintln!("Usage: csv_tool clean_invalid_lines <input_file> <output_file> <error_file>");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let output_file = &args[3];
+            let error_file = &args[4];
+
+            // Detectar cantidad de columnas esperadas desde el header
+            let header = {
+                let file = File::open(input_file)?;
+                let mut reader = BufReader::new(file);
+                let mut header_line = String::new();
+                reader.read_line(&mut header_line)?;
+                header_line.trim_end().split(',').count()
+            };
+
+            clean_invalid_lines(input_file, output_file, error_file, header)?;
+        },
+        "inspect_line" => {
+            if args.len() < 4 {
+                eprintln!("Usage: csv_tool inspect_line <input_file> <line_number> [context]");
+                return Ok(());
+            }
+            let input = &args[2];
+            let target: usize = args[3].parse().unwrap_or(1);
+            let context: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5);
+            inspect_line_range(input, target, context, false)?;
+        },
+        "find_missing_key" => {
+            if args.len() < 4 {
+                eprintln!("Usage: csv_tool find_missing_key <input_file> <key_column> [max_report]");
+                return Ok(());
+            }
+            let input = &args[2];
+            let key = &args[3];
+            let maxr: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(100);
+            find_missing_key(input, key, maxr)?;
+        },
+        "find_oversize" => {
+            if args.len() < 3 {
+                eprintln!("Usage: csv_tool find_oversize <input_file> [threshold_bytes] [max_report]");
+                return Ok(());
+            }
+            let input = &args[2];
+            let threshold: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(350_000);
+            let maxr: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10);
+            find_oversize_items(input, threshold, maxr)?;
+        },
+        "find_invalid_numeric" => {
+            if args.len() < 4 {
+                eprintln!("Usage: csv_tool find_invalid_numeric <input_file> <col1,col2,...> [max_report]");
+                return Ok(());
+            }
+            let input = &args[2];
+            let cols = &args[3];
+            let maxr: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(100);
+            find_invalid_numeric(input, cols, maxr)?;
+        },
+        "detect_missing_header" => {
+            if args.len() < 3 {
+                eprintln!("Usage: csv_tool detect_missing_header <input_file> [expected_header]");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let expected = args.get(3).map(|s| s.as_str());
+            let missing = detect_missing_header(input_file, expected)?;
+            if missing {
+                std::process::exit(1); // Exit with error code for scripting
+            }
+        },
+        "add_header" => {
+            if args.len() < 5 {
+                eprintln!("Usage: csv_tool add_header <input_file> <output_file> <model_type> [validate]");
+                eprintln!("  model_type: siisa_morosos, etc.");
+                eprintln!("  validate: Optional, 'true' to validate data after header addition");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let output_file = &args[3];
+            let model_type = &args[4];
+            let validate = args.get(5).map(|s| s == "true").unwrap_or(false);
+            
+            let header_added = detect_and_fix_missing_header(input_file, output_file, model_type)?;
+            
+            if header_added && validate {
+                println!("🔍 Validating file after header addition...");
+                enhanced_check(output_file, Some(model_type))?;
+            }
+        },
+        "batch_add_headers" => {
+            if args.len() < 4 {
+                eprintln!("Usage: csv_tool batch_add_headers <file_list.txt> <model_type> <output_dir>");
+                return Ok(());
+            }
+            let file_list = &args[2];
+            let model_type = &args[3];
+            let output_dir = &args[4];
+            
+            batch_add_headers(file_list, model_type, output_dir)?;
+        },
+        "sort_by_date" => {
+            if args.len() < 5 {
+                eprintln!("Usage: csv_tool sort_by_date <input_file> <output_file> <date_column> [asc|desc]");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let output_file = &args[3];
+            let date_column = &args[4];
+            let order = args.get(5).map(|s| s.as_str()).unwrap_or("desc"); // Changed default to "desc"
+            
+            sort_csv_by_date(input_file, output_file, date_column, order)?;
+        },
+        "find_oldest_date" => {
+            if args.len() < 4 {
+                eprintln!("Usage: csv_tool find_oldest_date <input_file> <date_column>");
+                eprintln!("  Encuentra la fecha más antigua en el CSV gigante (escaneo lineal, bajo uso de RAM).");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let date_column = &args[3];
+            find_extreme_date(input_file, date_column, true)?;
+        },
+        "find_newest_date" => {
+            if args.len() < 4 {
+                eprintln!("Usage: csv_tool find_newest_date <input_file> <date_column>");
+                eprintln!("  Encuentra la fecha más reciente en el CSV gigante");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let date_column = &args[3];
+            find_extreme_date(input_file, date_column, false)?;
+        },
+        "find_last_by_month" => {
+            if args.len() < 5 {
+                eprintln!("Usage: csv_tool find_last_by_month <input_file> <date_column> <year> <month>");
+                eprintln!("  Encuentra el último registro (fecha más reciente) de un mes/año específico");
+                eprintln!("  Example: csv_tool find_last_by_month data.csv CreateDate 2025 8");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let date_column = &args[3];
+            let year: i32 = args[4].parse()
+                .map_err(|_| "Invalid year format. Use: YYYY (e.g., 2025)")?;
+            let month: u32 = args[5].parse()
+                .map_err(|_| "Invalid month format. Use: 1-12")?;
+            
+            if month < 1 || month > 12 {
+                return Err("Month must be between 1 and 12".into());
+            }
+            
+            find_last_record_by_month(input_file, date_column, year, month)?;
+        },
+        "head" => {
+            if args.len() < 3 {
+                eprintln!("Usage: csv_tool head <input_file> [num_rows]");
+                eprintln!("  Shows the first N rows of a CSV file (default: 10)");
+                return Ok(());
+            }
+            let input_file = &args[2];
+            let num_rows: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+            head_csv(input_file, num_rows)?;
+        },
+        _ => {
+            eprintln!("Unknown command: {}", command);
+            help();
+        }
+    }
+
+    Ok(())
+}
+
+/// Enum para seleccionar el modelo según el nombre de la tabla DynamoDB
+pub enum DynamoModel {
+    SiisaMorosos,
+    // Aquí puedes agregar otros modelos en el futuro
+}
+
+/// Valida un CSV contra el modelo especificado por nombre de tabla DynamoDB.
+/// Guarda los errores en un archivo de texto.
+pub fn validate_csv_schema_with_model(
+    input_file: &str,
+    error_file: &str,
+    model: DynamoModel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    let file = File::open(input_file)?;
+    let mut rdr = csv::Reader::from_reader(file);
+    let mut error_writer = BufWriter::new(File::create(error_file)?);
+    let mut line_number = 2;
+    let mut error_count = 0;
+
+    match model {
+        DynamoModel::SiisaMorosos => {
+            for result in rdr.deserialize::<MorososTransmitDynamoDbModel>() {
+                match result {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = format!("Error en línea {}: {}\n", line_number, e);
+                        print!("{}", msg);
+                        error_writer.write_all(msg.as_bytes())?;
+                        error_count += 1;
+                    }
+                }
+                line_number += 1;
+            }
+        }
+        // Aquí puedes agregar otros modelos usando else if o match adicional
+        // DynamoModel::OtroModelo => { ... }
+    }
+
+    error_writer.flush()?;
+    println!(
+        "Validación completada. Total de errores: {}. Detalles en '{}'",
+        error_count, error_file
+    );
+    Ok(())
+}
+
+fn help() {
+    println!("Available commands:");
+    println!("  clean: Clean duplicate headers from a CSV file.");
+    println!("      Usage: csv_tool clean <input_file> <output_file>");
+    println!("  filter: Filter rows based on a column value.");
+    println!("      Usage: csv_tool filter <input_file> <output_file> <column_name> <value>");
+    println!("  check: Enhanced check for headers (duplicates + missing detection).");
+    println!("      Usage: csv_tool check <input_file> [model_type]");
+    println!("      - <model_type>: Optional model validation (e.g., 'siisa_morosos')");
+    println!("  count: Count the number of lines in a CSV file.");
+    println!("      Usage: csv_tool count <input_file>");
+    println!("  count_all: Count lines in multiple files listed in a text file.");
+    println!("      Usage: csv_tool count_all <file_list>");
+    println!("  count_unique: Count unique records across multiple files (fast, but needs RAM).");
+    println!("      Usage: csv_tool count_unique <file_list>");
+    println!("  merge_dedup: Merge multiple CSV files and remove duplicates (in-memory).");
+    println!("      Usage: csv_tool merge_dedup <file_list> <output_file>");
+    println!("  external_dedup: Merge and deduplicate using external sort (for HUGE files).");
+    println!("      Usage: csv_tool external_dedup <file_list> <output_file>");
+    println!("  estimate_memory: Estimate RAM needed for in-memory deduplication.");
+    println!("      Usage: csv_tool estimate_memory <file_list>");
+    println!("  compare: Compare first N rows of two CSV files.");
+    println!("      Usage: csv_tool compare <file1> <file2> <num_rows>");
+    println!("  tail: Show the last N rows of a CSV file.");
+    println!("      Usage: csv_tool tail <input_file> <num_rows>");
+    println!("  merge: Merge multiple CSV files (no deduplication).");
+    println!("      Usage: csv_tool merge <file_list> <output_file>");
+    println!();
+    println!("📋 VALIDATION & CLEANING COMMANDS:");
+    println!("  validate_model: Validate a CSV file against a DynamoDB model schema with progress bar.");
+    println!("      Usage: csv_tool validate_model <input_file> <error_file> <dynamo_table> <max_errors_to_show> <cancel_on_max_errors>");
+    println!("      - <input_file>: CSV file to validate");
+    println!("      - <error_file>: Output file for error details");
+    println!("      - <dynamo_table>: DynamoDB table/model name (e.g. siisa_morosos)");
+    println!("      - <max_errors_to_show>: Show up to N errors on screen (integer)");
+    println!("      - <cancel_on_max_errors>: true/false, if true cancels after showing N errors");
+    println!("  clean_invalid_lines: Genera una copia del CSV solo con líneas válidas (columnas correctas).");
+    println!("      Usage: csv_tool clean_invalid_lines <input_file> <output_file> <error_file>");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV de salida solo con líneas válidas");
+    println!("      - <error_file>: Archivo de texto con detalles de las líneas eliminadas");
+    println!();
+    println!("🔍 INSPECTION & DIAGNOSTIC COMMANDS:");
+    println!("  inspect_line: Inspecciona una línea específica en el CSV, mostrando contexto alrededor.");
+    println!("      Usage: csv_tool inspect_line <input_file> <line_number> [context]");
+    println!("      - <input_file>: Archivo CSV a inspeccionar");
+    println!("      - <line_number>: Número de línea a inspeccionar (1-based)");
+    println!("      - <context>: Número de líneas de contexto a mostrar antes y después (opcional, por defecto 5)");
+    println!("  find_missing_key: Busca claves faltantes en una columna específica del CSV.");
+    println!("      Usage: csv_tool find_missing_key <input_file> <key_column> [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <key_column>: Nombre de la columna clave a verificar");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 100)");
+    println!("  find_oversize: Encuentra líneas que exceden un tamaño umbral en bytes.");
+    println!("      Usage: csv_tool find_oversize <input_file> [threshold_bytes] [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <threshold_bytes>: Tamaño umbral en bytes (opcional, por defecto 350000)");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 10)");
+    println!("  find_invalid_numeric: Busca valores numéricos inválidos en columnas específicas.");
+    println!("      Usage: csv_tool find_invalid_numeric <input_file> <col1,col2,...> [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <col1,col2,...>: Nombres de las columnas a verificar, separadas por comas");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 100)");
+    println!();
+    println!("🔧 HEADER MANAGEMENT COMMANDS:");
+    println!("  detect_missing_header: Detecta si falta el header en el archivo CSV.");
+    println!("      Usage: csv_tool detect_missing_header <input_file> [expected_header]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <expected_header>: Opcional, patrón esperado del header (para validación específica)");
+    println!("      - Returns exit code 1 if header is missing (useful for scripts)");
+    println!("  add_header: Agrega un header faltante a un archivo CSV basado en el tipo de modelo.");
+    println!("      Usage: csv_tool add_header <input_file> <output_file> <model_type> [validate]");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV de salida con el header agregado");
+    println!("      - <model_type>: Tipo de modelo (ej. siisa_morosos) para determinar el header esperado");
+    println!("      - <validate>: Opcional, 'true' para validar los datos después de agregar el header");
+    println!("  batch_add_headers: Agrega headers a múltiples archivos CSV listados en un archivo de texto.");
+    println!("      Usage: csv_tool batch_add_headers <file_list.txt> <model_type> <output_dir>");
+    println!("      - <file_list.txt>: Archivo de texto con la lista de archivos CSV");
+    println!("      - <model_type>: Tipo de modelo para el header (ej. siisa_morosos)");
+    println!("      - <output_dir>: Directorio de salida para los archivos CSV con header agregado");
+    println!();
+    println!("📅 DATE OPERATIONS COMMANDS:");
+    println!("  sort_by_date: Ordena un CSV gigante por columna de fecha (external sort para bajo uso de RAM).");
+    println!("      Usage: csv_tool sort_by_date <input_file> <output_file> <date_column> [asc|desc]");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV ordenado de salida");
+    println!("      - <date_column>: Nombre de la columna de fecha (ej. CreateDate)");
+    println!("      - [asc|desc]: Orden ascendente (más antiguo primero) o descendente (más reciente primero), por defecto 'desc'");
+    println!("      - Formato de fecha soportado: MM/dd/yyyy hh:mm:ss AM/PM (ej. 8/13/2025 11:00:00 AM)");
+    println!("  find_oldest_date: Encuentra la fecha más antigua en un CSV gigante (escaneo lineal O(n), bajo uso de RAM).");
+    println!("      Usage: csv_tool find_oldest_date <input_file> <date_column>");
+    println!("      - Escanea todo el archivo sin ordenar completo");
+    println!("      - Continúa procesando ante errores de formato");
+    println!("      - Muestra progreso en tiempo real cada 100k registros");
+    println!("  find_newest_date: Encuentra la fecha más reciente en un CSV gigante.");
+    println!("      Usage: csv_tool find_newest_date <input_file> <date_column>");
+    println!("      - Mismo comportamiento que find_oldest_date pero busca la más reciente");
+    println!("  find_last_by_month: Encuentra el último registro (fecha más reciente) de un mes/año específico.");
+    println!("      Usage: csv_tool find_last_by_month <input_file> <date_column> <year> <month>");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <date_column>: Nombre de la columna de fecha (ej. CreateDate)");
+    println!("      - <year>: Año a buscar (ej. 2025)");
+    println!("      - <month>: Mes a buscar (1-12)");
+    println!("      - Si no encuentra coincidencias exactas, muestra el registro más cercano temporalmente");
+    println!("      - Calcula distancia en días antes/después del mes objetivo");
+    println!("      Example: csv_tool find_last_by_month data.csv CreateDate 2025 8");
+    println!();
+    println!("💡 TIPS:");
+    println!("  - Para archivos >100M registros, usar comandos de fecha sin contar líneas primero");
+    println!("  - Los comandos de fecha ignoran errores de formato y continúan procesando");
+    println!("  - Usar external_dedup para archivos que requieren >16GB RAM para merge_dedup");
+    println!("  - Todos los comandos de fecha muestran progreso en tiempo real");
+    println!("  - find_last_by_month es útil para análisis de datos mensuales sin ordenar todo el dataset");
+}
+
+fn count_all_files(file_list_path: &str) -> Result<(), Box<dyn Error>> {
+    // Obtener lista de archivos para estimación
+    let file = File::open(file_list_path)?;
+    let reader = BufReader::new(file);
+    let file_names: Vec<String> = reader.lines().collect::<Result<Vec<_>, _>>()?;
+    
+    println!("📊 Estimando total de líneas para progress...");
+    let estimated_total = estimate_total_lines_from_list(file_list_path)?;
+    println!("Estimación: ~{} líneas totales en {} archivos", estimated_total, file_names.len());
+    
+    let mut progress = ProgressTracker::new(estimated_total);
+    let mut total = 0;
+    let mut processed_lines = 0;
+
+    for filename in file_names {
+        let count = count_lines_with_progress(&filename, &mut progress, &mut processed_lines)?;
+        println!("\n{}: {} líneas", filename, count);
+        total += count;
+    }
+
+    progress.finish(&format!("📈 Total de líneas en todos los archivos: {}", total));
+    Ok(())
+}
+
+fn merge_and_deduplicate(file_list_path: &str, output_file: &str) -> Result<(), Box<dyn Error>> {
+    use std::collections::HashSet;
+
+    println!("🔄 Estimando total de líneas para merge...");
+    let estimated_total = estimate_total_lines_from_list(file_list_path)?;
+    println!("Estimación: ~{} líneas totales", estimated_total);
+    
+    let mut progress = ProgressTracker::new(estimated_total);
+    let mut processed_lines = 0;
+
+    let file_list = File::open(file_list_path)?;
+    let reader = BufReader::new(file_list);
+    let mut seen_lines = HashSet::new();
+    let mut writer = BufWriter::new(File::create(output_file)?);
+
+    let mut header_written = false;
+
+    for line in reader.lines() {
+        let filename = line?;
+        let input = File::open(&filename)?;
+        let file_reader = BufReader::new(input);
+
+        for (i, file_line) in file_reader.lines().enumerate() {
+            let line_content = file_line?;
+            processed_lines += 1;
+
+            if i == 0 {
+                if !header_written {
+                    writer.write_all(line_content.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    header_written = true;
+                }
+            } else {
+                if seen_lines.insert(line_content.clone()) {
+                    writer.write_all(line_content.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                }
+            }
+
+            // Actualizar progreso cada 1000 líneas
+            if processed_lines % 1000 == 0 {
+                progress.update(processed_lines);
+            }
+        }
+    }
+
+    writer.flush()?;
+    progress.finish(&format!("🔄 Merge completado, {} registros únicos guardados en {}", seen_lines.len(), output_file));
+    Ok(())
+}
+
+fn count_lines_with_progress(input_file: &str, progress: &mut ProgressTracker, processed_lines: &mut usize) -> Result<usize, Box<dyn Error>> {
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+    let mut line_count = 0;
+
+    for _line in reader.lines() {
+        line_count += 1;
+        *processed_lines += 1;
+        
+        // Actualizar progreso cada 1000 líneas para mejor rendimiento
+        if line_count % 1000 == 0 {
+            progress.update(*processed_lines);
+        }
+    }
+    
+    progress.update(*processed_lines);
+    Ok(line_count)
+}
+
+fn count_lines(input_file: &str) -> Result<usize, Box<dyn Error>> {
+
+    print!("Counting lines in file: {}...", input_file);
+    let start = Instant::now();
+    let file = File::open(input_file).expect("Failed to open file");
+    let reader = BufReader::new(file);
+
+    let line_count = reader.lines().count();
+
+    let _ = start.elapsed().as_secs_f64();
+    println!("Time taken to count {} lines: {:.2} seconds",line_count, start.elapsed().as_secs_f64());
+
+    Ok(line_count)
+}
+
+fn has_duplicate_header(file_path: &str) -> Result<bool, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let mut reader = BufReader::new(file);
+    let mut result = false;
+
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line)? == 0 {
+        result = false; // Empty file, no duplicates
+    }
+
+    let header = first_line.trim_end().to_string();
+    let mut line_number = 1;
+
+    for line in reader.lines() {
+        line_number += 1;
+        let line = line?;
+        if line.trim_end() == header {
+            println!("Duplicate header found on line {}", line_number);
+            result = true;
+        }
+    }
+
+    Ok(result)
+}
+
+fn clean_headers(input_file: &str, output_file: &str) -> Result<(), Box<dyn Error>> {
+    let input = File::open(input_file)?;
+    let reader = BufReader::new(input);
+    let output = File::create(output_file)?;
+    let mut writer = BufWriter::new(output);
+
+    let mut first_line = String::new();
+    let mut lines = reader.lines();
+
+    if let Some(Ok(header)) = lines.next() {
+        first_line = header;
+        writer.write_all(first_line.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+
+    for line in lines {
+        let line = line?;
+        if line != first_line {
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+    }
+
+    writer.flush()?;
+    println!("Header cleanup complete.");
+    Ok(())
+}
+
+fn filter_rows(input_file: &str, output_file: &str, column_name: &str, value: &str) -> Result<(), Box<dyn Error>> {
+    let input = File::open(input_file)?;
+    let reader = BufReader::new(input);
+    let output = File::create(output_file)?;
+    let mut writer = WriterBuilder::new().has_headers(true).from_writer(BufWriter::new(output));
+
+    let mut rdr = csv::Reader::from_reader(reader);
+    let headers = rdr.headers()?.clone();
+    writer.write_record(headers.iter())?;
+
+    let column_index = headers.iter().position(|h| h == column_name).ok_or_else(|| {
+        format!("Column '{}' not found in input file", column_name)
+    })?;
+
+    for result in rdr.records() {
+        let record = result?;
+        if record.get(column_index).unwrap_or("") == value {
+            writer.write_record(&record)?;
+        }
+    }
+
+    writer.flush()?;
+    println!("Row filtering complete.");
+    Ok(())
+}
+
+fn compare_first_n(file1: &str, file2: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    let f1 = File::open(file1)?;
+    let f2 = File::open(file2)?;
+    let reader1 = BufReader::new(f1);
+    let reader2 = BufReader::new(f2);
+
+    let mut lines1 = reader1.lines();
+    let mut lines2 = reader2.lines();
+
+    let header1 = lines1.next().unwrap_or(Ok(String::new()))?;
+    let header2 = lines2.next().unwrap_or(Ok(String::new()))?;
+
+    if header1 != header2 {
+        println!("⚠️ Header mismatch!");
+        println!("File1 header: {}", header1);
+        println!("File2 header: {}", header2);
+    } else {
+        println!("✅ Headers match.");
+    }
+
+    println!("Comparing first {} data rows...", num_rows);
+
+    let mut differences = 0;
+
+    for i in 1..=num_rows {
+        let line1 = lines1.next().unwrap_or(Ok(String::new()))?;
+        let line2 = lines2.next().unwrap_or(Ok(String::new()))?;
+
+        if line1 != line2 {
+            println!("❌ Difference at line {}:", i + 1);
+            println!("File1: {}", line1);
+            println!("File2: {}", line2);
+            differences += 1;
+        }
+    }
+
+    if differences == 0 {
+        println!("🎉 No differences found in the first {} rows.", num_rows);
+    } else {
+        println!("🔍 Found {} differences in the first {} rows.", differences, num_rows);
+    }
+
+    Ok(())
+}
+
+fn tail_csv(input_file: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    use std::collections::VecDeque;
+
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+
+    let mut lines = reader.lines();
+    let header = lines.next().unwrap_or(Ok(String::new()))?;
+    let mut buffer = VecDeque::with_capacity(num_rows);
+
+    for line in lines {
+        let line = line?;
+        if buffer.len() == num_rows {
+            buffer.pop_front();
+        }
+        buffer.push_back(line);
+    }
+
+    println!("{}", header);
+    for line in buffer {
+        println!("{}", line);
+    }
+
+    Ok(())
+}
+
+/// Muestra las primeras N filas de un CSV (optimizado para archivos gigantes)
+fn head_csv(input_file: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+    
+    let mut lines = reader.lines();
+    
+    // Mostrar header
+    if let Some(Ok(header)) = lines.next() {
+        println!("{}", header);
+    } else {
+        println!("❌ Archivo vacío o sin header");
+        return Ok(());
+    }
+    
+    // Mostrar N filas de datos
+    let mut count = 0;
+    for line in lines {
+        if count >= num_rows {
+            break;
+        }
+        println!("{}", line?);
+        count += 1;
+    }
+    
+    println!("\n📊 Mostrando {} de las primeras {} filas de datos", count, num_rows);
+    
+    Ok(())
+}
+
+/// Enum para seleccionar el modelo según el nombre de la tabla DynamoDB
+pub enum DynamoModel {
+    SiisaMorosos,
+    // Aquí puedes agregar otros modelos en el futuro
+}
+
+/// Valida un CSV contra el modelo especificado por nombre de tabla DynamoDB.
+/// Guarda los errores en un archivo de texto.
+pub fn validate_csv_schema_with_model(
+    input_file: &str,
+    error_file: &str,
+    model: DynamoModel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    let file = File::open(input_file)?;
+    let mut rdr = csv::Reader::from_reader(file);
+    let mut error_writer = BufWriter::new(File::create(error_file)?);
+    let mut line_number = 2;
+    let mut error_count = 0;
+
+    match model {
+        DynamoModel::SiisaMorosos => {
+            for result in rdr.deserialize::<MorososTransmitDynamoDbModel>() {
+                match result {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = format!("Error en línea {}: {}\n", line_number, e);
+                        print!("{}", msg);
+                        error_writer.write_all(msg.as_bytes())?;
+                        error_count += 1;
+                    }
+                }
+                line_number += 1;
+            }
+        }
+        // Aquí puedes agregar otros modelos usando else if o match adicional
+        // DynamoModel::OtroModelo => { ... }
+    }
+
+    error_writer.flush()?;
+    println!(
+        "Validación completada. Total de errores: {}. Detalles en '{}'",
+        error_count, error_file
+    );
+    Ok(())
+}
+
+fn help() {
+    println!("Available commands:");
+    println!("  clean: Clean duplicate headers from a CSV file.");
+    println!("      Usage: csv_tool clean <input_file> <output_file>");
+    println!("  filter: Filter rows based on a column value.");
+    println!("      Usage: csv_tool filter <input_file> <output_file> <column_name> <value>");
+    println!("  check: Enhanced check for headers (duplicates + missing detection).");
+    println!("      Usage: csv_tool check <input_file> [model_type]");
+    println!("      - <model_type>: Optional model validation (e.g., 'siisa_morosos')");
+    println!("  count: Count the number of lines in a CSV file.");
+    println!("      Usage: csv_tool count <input_file>");
+    println!("  count_all: Count lines in multiple files listed in a text file.");
+    println!("      Usage: csv_tool count_all <file_list>");
+    println!("  count_unique: Count unique records across multiple files (fast, but needs RAM).");
+    println!("      Usage: csv_tool count_unique <file_list>");
+    println!("  merge_dedup: Merge multiple CSV files and remove duplicates (in-memory).");
+    println!("      Usage: csv_tool merge_dedup <file_list> <output_file>");
+    println!("  external_dedup: Merge and deduplicate using external sort (for HUGE files).");
+    println!("      Usage: csv_tool external_dedup <file_list> <output_file>");
+    println!("  estimate_memory: Estimate RAM needed for in-memory deduplication.");
+    println!("      Usage: csv_tool estimate_memory <file_list>");
+    println!("  compare: Compare first N rows of two CSV files.");
+    println!("      Usage: csv_tool compare <file1> <file2> <num_rows>");
+    println!("  tail: Show the last N rows of a CSV file.");
+    println!("      Usage: csv_tool tail <input_file> <num_rows>");
+    println!("  merge: Merge multiple CSV files (no deduplication).");
+    println!("      Usage: csv_tool merge <file_list> <output_file>");
+    println!();
+    println!("📋 VALIDATION & CLEANING COMMANDS:");
+    println!("  validate_model: Validate a CSV file against a DynamoDB model schema with progress bar.");
+    println!("      Usage: csv_tool validate_model <input_file> <error_file> <dynamo_table> <max_errors_to_show> <cancel_on_max_errors>");
+    println!("      - <input_file>: CSV file to validate");
+    println!("      - <error_file>: Output file for error details");
+    println!("      - <dynamo_table>: DynamoDB table/model name (e.g. siisa_morosos)");
+    println!("      - <max_errors_to_show>: Show up to N errors on screen (integer)");
+    println!("      - <cancel_on_max_errors>: true/false, if true cancels after showing N errors");
+    println!("  clean_invalid_lines: Genera una copia del CSV solo con líneas válidas (columnas correctas).");
+    println!("      Usage: csv_tool clean_invalid_lines <input_file> <output_file> <error_file>");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV de salida solo con líneas válidas");
+    println!("      - <error_file>: Archivo de texto con detalles de las líneas eliminadas");
+    println!();
+    println!("🔍 INSPECTION & DIAGNOSTIC COMMANDS:");
+    println!("  inspect_line: Inspecciona una línea específica en el CSV, mostrando contexto alrededor.");
+    println!("      Usage: csv_tool inspect_line <input_file> <line_number> [context]");
+    println!("      - <input_file>: Archivo CSV a inspeccionar");
+    println!("      - <line_number>: Número de línea a inspeccionar (1-based)");
+    println!("      - <context>: Número de líneas de contexto a mostrar antes y después (opcional, por defecto 5)");
+    println!("  find_missing_key: Busca claves faltantes en una columna específica del CSV.");
+    println!("      Usage: csv_tool find_missing_key <input_file> <key_column> [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <key_column>: Nombre de la columna clave a verificar");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 100)");
+    println!("  find_oversize: Encuentra líneas que exceden un tamaño umbral en bytes.");
+    println!("      Usage: csv_tool find_oversize <input_file> [threshold_bytes] [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <threshold_bytes>: Tamaño umbral en bytes (opcional, por defecto 350000)");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 10)");
+    println!("  find_invalid_numeric: Busca valores numéricos inválidos en columnas específicas.");
+    println!("      Usage: csv_tool find_invalid_numeric <input_file> <col1,col2,...> [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <col1,col2,...>: Nombres de las columnas a verificar, separadas por comas");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 100)");
+    println!();
+    println!("🔧 HEADER MANAGEMENT COMMANDS:");
+    println!("  detect_missing_header: Detecta si falta el header en el archivo CSV.");
+    println!("      Usage: csv_tool detect_missing_header <input_file> [expected_header]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <expected_header>: Opcional, patrón esperado del header (para validación específica)");
+    println!("      - Returns exit code 1 if header is missing (useful for scripts)");
+    println!("  add_header: Agrega un header faltante a un archivo CSV basado en el tipo de modelo.");
+    println!("      Usage: csv_tool add_header <input_file> <output_file> <model_type> [validate]");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV de salida con el header agregado");
+    println!("      - <model_type>: Tipo de modelo (ej. siisa_morosos) para determinar el header esperado");
+    println!("      - <validate>: Opcional, 'true' para validar los datos después de agregar el header");
+    println!("  batch_add_headers: Agrega headers a múltiples archivos CSV listados en un archivo de texto.");
+    println!("      Usage: csv_tool batch_add_headers <file_list.txt> <model_type> <output_dir>");
+    println!("      - <file_list.txt>: Archivo de texto con la lista de archivos CSV");
+    println!("      - <model_type>: Tipo de modelo para el header (ej. siisa_morosos)");
+    println!("      - <output_dir>: Directorio de salida para los archivos CSV con header agregado");
+    println!();
+    println!("📅 DATE OPERATIONS COMMANDS:");
+    println!("  sort_by_date: Ordena un CSV gigante por columna de fecha (external sort para bajo uso de RAM).");
+    println!("      Usage: csv_tool sort_by_date <input_file> <output_file> <date_column> [asc|desc]");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV ordenado de salida");
+    println!("      - <date_column>: Nombre de la columna de fecha (ej. CreateDate)");
+    println!("      - [asc|desc]: Orden ascendente (más antiguo primero) o descendente (más reciente primero), por defecto 'desc'");
+    println!("      - Formato de fecha soportado: MM/dd/yyyy hh:mm:ss AM/PM (ej. 8/13/2025 11:00:00 AM)");
+    println!("  find_oldest_date: Encuentra la fecha más antigua en un CSV gigante (escaneo lineal O(n), bajo uso de RAM).");
+    println!("      Usage: csv_tool find_oldest_date <input_file> <date_column>");
+    println!("      - Escanea todo el archivo sin ordenar completo");
+    println!("      - Continúa procesando ante errores de formato");
+    println!("      - Muestra progreso en tiempo real cada 100k registros");
+    println!("  find_newest_date: Encuentra la fecha más reciente en un CSV gigante.");
+    println!("      Usage: csv_tool find_newest_date <input_file> <date_column>");
+    println!("      - Mismo comportamiento que find_oldest_date pero busca la más reciente");
+    println!("  find_last_by_month: Encuentra el último registro (fecha más reciente) de un mes/año específico.");
+    println!("      Usage: csv_tool find_last_by_month <input_file> <date_column> <year> <month>");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <date_column>: Nombre de la columna de fecha (ej. CreateDate)");
+    println!("      - <year>: Año a buscar (ej. 2025)");
+    println!("      - <month>: Mes a buscar (1-12)");
+    println!("      - Si no encuentra coincidencias exactas, muestra el registro más cercano temporalmente");
+    println!("      - Calcula distancia en días antes/después del mes objetivo");
+    println!("      Example: csv_tool find_last_by_month data.csv CreateDate 2025 8");
+    println!();
+    println!("💡 TIPS:");
+    println!("  - Para archivos >100M registros, usar comandos de fecha sin contar líneas primero");
+    println!("  - Los comandos de fecha ignoran errores de formato y continúan procesando");
+    println!("  - Usar external_dedup para archivos que requieren >16GB RAM para merge_dedup");
+    println!("  - Todos los comandos de fecha muestran progreso en tiempo real");
+    println!("  - find_last_by_month es útil para análisis de datos mensuales sin ordenar todo el dataset");
+}
+
+fn count_all_files(file_list_path: &str) -> Result<(), Box<dyn Error>> {
+    // Obtener lista de archivos para estimación
+    let file = File::open(file_list_path)?;
+    let reader = BufReader::new(file);
+    let file_names: Vec<String> = reader.lines().collect::<Result<Vec<_>, _>>()?;
+    
+    println!("📊 Estimando total de líneas para progress...");
+    let estimated_total = estimate_total_lines_from_list(file_list_path)?;
+    println!("Estimación: ~{} líneas totales en {} archivos", estimated_total, file_names.len());
+    
+    let mut progress = ProgressTracker::new(estimated_total);
+    let mut total = 0;
+    let mut processed_lines = 0;
+
+    for filename in file_names {
+        let count = count_lines_with_progress(&filename, &mut progress, &mut processed_lines)?;
+        println!("\n{}: {} líneas", filename, count);
+        total += count;
+    }
+
+    progress.finish(&format!("📈 Total de líneas en todos los archivos: {}", total));
+    Ok(())
+}
+
+fn merge_and_deduplicate(file_list_path: &str, output_file: &str) -> Result<(), Box<dyn Error>> {
+    use std::collections::HashSet;
+
+    println!("🔄 Estimando total de líneas para merge...");
+    let estimated_total = estimate_total_lines_from_list(file_list_path)?;
+    println!("Estimación: ~{} líneas totales", estimated_total);
+    
+    let mut progress = ProgressTracker::new(estimated_total);
+    let mut processed_lines = 0;
+
+    let file_list = File::open(file_list_path)?;
+    let reader = BufReader::new(file_list);
+    let mut seen_lines = HashSet::new();
+    let mut writer = BufWriter::new(File::create(output_file)?);
+
+    let mut header_written = false;
+
+    for line in reader.lines() {
+        let filename = line?;
+        let input = File::open(&filename)?;
+        let file_reader = BufReader::new(input);
+
+        for (i, file_line) in file_reader.lines().enumerate() {
+            let line_content = file_line?;
+            processed_lines += 1;
+
+            if i == 0 {
+                if !header_written {
+                    writer.write_all(line_content.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    header_written = true;
+                }
+            } else {
+                if seen_lines.insert(line_content.clone()) {
+                    writer.write_all(line_content.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                }
+            }
+
+            // Actualizar progreso cada 1000 líneas
+            if processed_lines % 1000 == 0 {
+                progress.update(processed_lines);
+            }
+        }
+    }
+
+    writer.flush()?;
+    progress.finish(&format!("🔄 Merge completado, {} registros únicos guardados en {}", seen_lines.len(), output_file));
+    Ok(())
+}
+
+fn count_lines_with_progress(input_file: &str, progress: &mut ProgressTracker, processed_lines: &mut usize) -> Result<usize, Box<dyn Error>> {
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+    let mut line_count = 0;
+
+    for _line in reader.lines() {
+        line_count += 1;
+        *processed_lines += 1;
+        
+        // Actualizar progreso cada 1000 líneas para mejor rendimiento
+        if line_count % 1000 == 0 {
+            progress.update(*processed_lines);
+        }
+    }
+    
+    progress.update(*processed_lines);
+    Ok(line_count)
+}
+
+fn count_lines(input_file: &str) -> Result<usize, Box<dyn Error>> {
+
+    print!("Counting lines in file: {}...", input_file);
+    let start = Instant::now();
+    let file = File::open(input_file).expect("Failed to open file");
+    let reader = BufReader::new(file);
+
+    let line_count = reader.lines().count();
+
+    let _ = start.elapsed().as_secs_f64();
+    println!("Time taken to count {} lines: {:.2} seconds",line_count, start.elapsed().as_secs_f64());
+
+    Ok(line_count)
+}
+
+fn has_duplicate_header(file_path: &str) -> Result<bool, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let mut reader = BufReader::new(file);
+    let mut result = false;
+
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line)? == 0 {
+        result = false; // Empty file, no duplicates
+    }
+
+    let header = first_line.trim_end().to_string();
+    let mut line_number = 1;
+
+    for line in reader.lines() {
+        line_number += 1;
+        let line = line?;
+        if line.trim_end() == header {
+            println!("Duplicate header found on line {}", line_number);
+            result = true;
+        }
+    }
+
+    Ok(result)
+}
+
+fn clean_headers(input_file: &str, output_file: &str) -> Result<(), Box<dyn Error>> {
+    let input = File::open(input_file)?;
+    let reader = BufReader::new(input);
+    let output = File::create(output_file)?;
+    let mut writer = BufWriter::new(output);
+
+    let mut first_line = String::new();
+    let mut lines = reader.lines();
+
+    if let Some(Ok(header)) = lines.next() {
+        first_line = header;
+        writer.write_all(first_line.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+
+    for line in lines {
+        let line = line?;
+        if line != first_line {
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+    }
+
+    writer.flush()?;
+    println!("Header cleanup complete.");
+    Ok(())
+}
+
+fn filter_rows(input_file: &str, output_file: &str, column_name: &str, value: &str) -> Result<(), Box<dyn Error>> {
+    let input = File::open(input_file)?;
+    let reader = BufReader::new(input);
+    let output = File::create(output_file)?;
+    let mut writer = WriterBuilder::new().has_headers(true).from_writer(BufWriter::new(output));
+
+    let mut rdr = csv::Reader::from_reader(reader);
+    let headers = rdr.headers()?.clone();
+    writer.write_record(headers.iter())?;
+
+    let column_index = headers.iter().position(|h| h == column_name).ok_or_else(|| {
+        format!("Column '{}' not found in input file", column_name)
+    })?;
+
+    for result in rdr.records() {
+        let record = result?;
+        if record.get(column_index).unwrap_or("") == value {
+            writer.write_record(&record)?;
+        }
+    }
+
+    writer.flush()?;
+    println!("Row filtering complete.");
+    Ok(())
+}
+
+fn compare_first_n(file1: &str, file2: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    let f1 = File::open(file1)?;
+    let f2 = File::open(file2)?;
+    let reader1 = BufReader::new(f1);
+    let reader2 = BufReader::new(f2);
+
+    let mut lines1 = reader1.lines();
+    let mut lines2 = reader2.lines();
+
+    let header1 = lines1.next().unwrap_or(Ok(String::new()))?;
+    let header2 = lines2.next().unwrap_or(Ok(String::new()))?;
+
+    if header1 != header2 {
+        println!("⚠️ Header mismatch!");
+        println!("File1 header: {}", header1);
+        println!("File2 header: {}", header2);
+    } else {
+        println!("✅ Headers match.");
+    }
+
+    println!("Comparing first {} data rows...", num_rows);
+
+    let mut differences = 0;
+
+    for i in 1..=num_rows {
+        let line1 = lines1.next().unwrap_or(Ok(String::new()))?;
+        let line2 = lines2.next().unwrap_or(Ok(String::new()))?;
+
+        if line1 != line2 {
+            println!("❌ Difference at line {}:", i + 1);
+            println!("File1: {}", line1);
+            println!("File2: {}", line2);
+            differences += 1;
+        }
+    }
+
+    if differences == 0 {
+        println!("🎉 No differences found in the first {} rows.", num_rows);
+    } else {
+        println!("🔍 Found {} differences in the first {} rows.", differences, num_rows);
+    }
+
+    Ok(())
+}
+
+fn tail_csv(input_file: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    use std::collections::VecDeque;
+
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+
+    let mut lines = reader.lines();
+    let header = lines.next().unwrap_or(Ok(String::new()))?;
+    let mut buffer = VecDeque::with_capacity(num_rows);
+
+    for line in lines {
+        let line = line?;
+        if buffer.len() == num_rows {
+            buffer.pop_front();
+        }
+        buffer.push_back(line);
+    }
+
+    println!("{}", header);
+    for line in buffer {
+        println!("{}", line);
+    }
+
+    Ok(())
+}
+
+/// Muestra las primeras N filas de un CSV (optimizado para archivos gigantes)
+fn head_csv(input_file: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+    
+    let mut lines = reader.lines();
+    
+    // Mostrar header
+    if let Some(Ok(header)) = lines.next() {
+        println!("{}", header);
+    } else {
+        println!("❌ Archivo vacío o sin header");
+        return Ok(());
+    }
+    
+    // Mostrar N filas de datos
+    let mut count = 0;
+    for line in lines {
+        if count >= num_rows {
+            break;
+        }
+        println!("{}", line?);
+        count += 1;
+    }
+    
+    println!("\n📊 Mostrando {} de las primeras {} filas de datos", count, num_rows);
+    
+    Ok(())
+}
+
+/// Enum para seleccionar el modelo según el nombre de la tabla DynamoDB
+pub enum DynamoModel {
+    SiisaMorosos,
+    // Aquí puedes agregar otros modelos en el futuro
+}
+
+/// Valida un CSV contra el modelo especificado por nombre de tabla DynamoDB.
+/// Guarda los errores en un archivo de texto.
+pub fn validate_csv_schema_with_model(
+    input_file: &str,
+    error_file: &str,
+    model: DynamoModel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    let file = File::open(input_file)?;
+    let mut rdr = csv::Reader::from_reader(file);
+    let mut error_writer = BufWriter::new(File::create(error_file)?);
+    let mut line_number = 2;
+    let mut error_count = 0;
+
+    match model {
+        DynamoModel::SiisaMorosos => {
+            for result in rdr.deserialize::<MorososTransmitDynamoDbModel>() {
+                match result {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = format!("Error en línea {}: {}\n", line_number, e);
+                        print!("{}", msg);
+                        error_writer.write_all(msg.as_bytes())?;
+                        error_count += 1;
+                    }
+                }
+                line_number += 1;
+            }
+        }
+        // Aquí puedes agregar otros modelos usando else if o match adicional
+        // DynamoModel::OtroModelo => { ... }
+    }
+
+    error_writer.flush()?;
+    println!(
+        "Validación completada. Total de errores: {}. Detalles en '{}'",
+        error_count, error_file
+    );
+    Ok(())
+}
+
+fn help() {
+    println!("Available commands:");
+    println!("  clean: Clean duplicate headers from a CSV file.");
+    println!("      Usage: csv_tool clean <input_file> <output_file>");
+    println!("  filter: Filter rows based on a column value.");
+    println!("      Usage: csv_tool filter <input_file> <output_file> <column_name> <value>");
+    println!("  check: Enhanced check for headers (duplicates + missing detection).");
+    println!("      Usage: csv_tool check <input_file> [model_type]");
+    println!("      - <model_type>: Optional model validation (e.g., 'siisa_morosos')");
+    println!("  count: Count the number of lines in a CSV file.");
+    println!("      Usage: csv_tool count <input_file>");
+    println!("  count_all: Count lines in multiple files listed in a text file.");
+    println!("      Usage: csv_tool count_all <file_list>");
+    println!("  count_unique: Count unique records across multiple files (fast, but needs RAM).");
+    println!("      Usage: csv_tool count_unique <file_list>");
+    println!("  merge_dedup: Merge multiple CSV files and remove duplicates (in-memory).");
+    println!("      Usage: csv_tool merge_dedup <file_list> <output_file>");
+    println!("  external_dedup: Merge and deduplicate using external sort (for HUGE files).");
+    println!("      Usage: csv_tool external_dedup <file_list> <output_file>");
+    println!("  estimate_memory: Estimate RAM needed for in-memory deduplication.");
+    println!("      Usage: csv_tool estimate_memory <file_list>");
+    println!("  compare: Compare first N rows of two CSV files.");
+    println!("      Usage: csv_tool compare <file1> <file2> <num_rows>");
+    println!("  tail: Show the last N rows of a CSV file.");
+    println!("      Usage: csv_tool tail <input_file> <num_rows>");
+    println!("  merge: Merge multiple CSV files (no deduplication).");
+    println!("      Usage: csv_tool merge <file_list> <output_file>");
+    println!();
+    println!("📋 VALIDATION & CLEANING COMMANDS:");
+    println!("  validate_model: Validate a CSV file against a DynamoDB model schema with progress bar.");
+    println!("      Usage: csv_tool validate_model <input_file> <error_file> <dynamo_table> <max_errors_to_show> <cancel_on_max_errors>");
+    println!("      - <input_file>: CSV file to validate");
+    println!("      - <error_file>: Output file for error details");
+    println!("      - <dynamo_table>: DynamoDB table/model name (e.g. siisa_morosos)");
+    println!("      - <max_errors_to_show>: Show up to N errors on screen (integer)");
+    println!("      - <cancel_on_max_errors>: true/false, if true cancels after showing N errors");
+    println!("  clean_invalid_lines: Genera una copia del CSV solo con líneas válidas (columnas correctas).");
+    println!("      Usage: csv_tool clean_invalid_lines <input_file> <output_file> <error_file>");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV de salida solo con líneas válidas");
+    println!("      - <error_file>: Archivo de texto con detalles de las líneas eliminadas");
+    println!();
+    println!("🔍 INSPECTION & DIAGNOSTIC COMMANDS:");
+    println!("  inspect_line: Inspecciona una línea específica en el CSV, mostrando contexto alrededor.");
+    println!("      Usage: csv_tool inspect_line <input_file> <line_number> [context]");
+    println!("      - <input_file>: Archivo CSV a inspeccionar");
+    println!("      - <line_number>: Número de línea a inspeccionar (1-based)");
+    println!("      - <context>: Número de líneas de contexto a mostrar antes y después (opcional, por defecto 5)");
+    println!("  find_missing_key: Busca claves faltantes en una columna específica del CSV.");
+    println!("      Usage: csv_tool find_missing_key <input_file> <key_column> [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <key_column>: Nombre de la columna clave a verificar");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 100)");
+    println!("  find_oversize: Encuentra líneas que exceden un tamaño umbral en bytes.");
+    println!("      Usage: csv_tool find_oversize <input_file> [threshold_bytes] [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <threshold_bytes>: Tamaño umbral en bytes (opcional, por defecto 350000)");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 10)");
+    println!("  find_invalid_numeric: Busca valores numéricos inválidos en columnas específicas.");
+    println!("      Usage: csv_tool find_invalid_numeric <input_file> <col1,col2,...> [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <col1,col2,...>: Nombres de las columnas a verificar, separadas por comas");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 100)");
+    println!();
+    println!("🔧 HEADER MANAGEMENT COMMANDS:");
+    println!("  detect_missing_header: Detecta si falta el header en el archivo CSV.");
+    println!("      Usage: csv_tool detect_missing_header <input_file> [expected_header]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <expected_header>: Opcional, patrón esperado del header (para validación específica)");
+    println!("      - Returns exit code 1 if header is missing (useful for scripts)");
+    println!("  add_header: Agrega un header faltante a un archivo CSV basado en el tipo de modelo.");
+    println!("      Usage: csv_tool add_header <input_file> <output_file> <model_type> [validate]");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV de salida con el header agregado");
+    println!("      - <model_type>: Tipo de modelo (ej. siisa_morosos) para determinar el header esperado");
+    println!("      - <validate>: Opcional, 'true' para validar los datos después de agregar el header");
+    println!("  batch_add_headers: Agrega headers a múltiples archivos CSV listados en un archivo de texto.");
+    println!("      Usage: csv_tool batch_add_headers <file_list.txt> <model_type> <output_dir>");
+    println!("      - <file_list.txt>: Archivo de texto con la lista de archivos CSV");
+    println!("      - <model_type>: Tipo de modelo para el header (ej. siisa_morosos)");
+    println!("      - <output_dir>: Directorio de salida para los archivos CSV con header agregado");
+    println!();
+    println!("📅 DATE OPERATIONS COMMANDS:");
+    println!("  sort_by_date: Ordena un CSV gigante por columna de fecha (external sort para bajo uso de RAM).");
+    println!("      Usage: csv_tool sort_by_date <input_file> <output_file> <date_column> [asc|desc]");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV ordenado de salida");
+    println!("      - <date_column>: Nombre de la columna de fecha (ej. CreateDate)");
+    println!("      - [asc|desc]: Orden ascendente (más antiguo primero) o descendente (más reciente primero), por defecto 'desc'");
+    println!("      - Formato de fecha soportado: MM/dd/yyyy hh:mm:ss AM/PM (ej. 8/13/2025 11:00:00 AM)");
+    println!("  find_oldest_date: Encuentra la fecha más antigua en un CSV gigante (escaneo lineal O(n), bajo uso de RAM).");
+    println!("      Usage: csv_tool find_oldest_date <input_file> <date_column>");
+    println!("      - Escanea todo el archivo sin ordenar completo");
+    println!("      - Continúa procesando ante errores de formato");
+    println!("      - Muestra progreso en tiempo real cada 100k registros");
+    println!("  find_newest_date: Encuentra la fecha más reciente en un CSV gigante.");
+    println!("      Usage: csv_tool find_newest_date <input_file> <date_column>");
+    println!("      - Mismo comportamiento que find_oldest_date pero busca la más reciente");
+    println!("  find_last_by_month: Encuentra el último registro (fecha más reciente) de un mes/año específico.");
+    println!("      Usage: csv_tool find_last_by_month <input_file> <date_column> <year> <month>");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <date_column>: Nombre de la columna de fecha (ej. CreateDate)");
+    println!("      - <year>: Año a buscar (ej. 2025)");
+    println!("      - <month>: Mes a buscar (1-12)");
+    println!("      - Si no encuentra coincidencias exactas, muestra el registro más cercano temporalmente");
+    println!("      - Calcula distancia en días antes/después del mes objetivo");
+    println!("      Example: csv_tool find_last_by_month data.csv CreateDate 2025 8");
+    println!();
+    println!("💡 TIPS:");
+    println!("  - Para archivos >100M registros, usar comandos de fecha sin contar líneas primero");
+    println!("  - Los comandos de fecha ignoran errores de formato y continúan procesando");
+    println!("  - Usar external_dedup para archivos que requieren >16GB RAM para merge_dedup");
+    println!("  - Todos los comandos de fecha muestran progreso en tiempo real");
+    println!("  - find_last_by_month es útil para análisis de datos mensuales sin ordenar todo el dataset");
+}
+
+fn count_all_files(file_list_path: &str) -> Result<(), Box<dyn Error>> {
+    // Obtener lista de archivos para estimación
+    let file = File::open(file_list_path)?;
+    let reader = BufReader::new(file);
+    let file_names: Vec<String> = reader.lines().collect::<Result<Vec<_>, _>>()?;
+    
+    println!("📊 Estimando total de líneas para progress...");
+    let estimated_total = estimate_total_lines_from_list(file_list_path)?;
+    println!("Estimación: ~{} líneas totales en {} archivos", estimated_total, file_names.len());
+    
+    let mut progress = ProgressTracker::new(estimated_total);
+    let mut total = 0;
+    let mut processed_lines = 0;
+
+    for filename in file_names {
+        let count = count_lines_with_progress(&filename, &mut progress, &mut processed_lines)?;
+        println!("\n{}: {} líneas", filename, count);
+        total += count;
+    }
+
+    progress.finish(&format!("📈 Total de líneas en todos los archivos: {}", total));
+    Ok(())
+}
+
+fn merge_and_deduplicate(file_list_path: &str, output_file: &str) -> Result<(), Box<dyn Error>> {
+    use std::collections::HashSet;
+
+    println!("🔄 Estimando total de líneas para merge...");
+    let estimated_total = estimate_total_lines_from_list(file_list_path)?;
+    println!("Estimación: ~{} líneas totales", estimated_total);
+    
+    let mut progress = ProgressTracker::new(estimated_total);
+    let mut processed_lines = 0;
+
+    let file_list = File::open(file_list_path)?;
+    let reader = BufReader::new(file_list);
+    let mut seen_lines = HashSet::new();
+    let mut writer = BufWriter::new(File::create(output_file)?);
+
+    let mut header_written = false;
+
+    for line in reader.lines() {
+        let filename = line?;
+        let input = File::open(&filename)?;
+        let file_reader = BufReader::new(input);
+
+        for (i, file_line) in file_reader.lines().enumerate() {
+            let line_content = file_line?;
+            processed_lines += 1;
+
+            if i == 0 {
+                if !header_written {
+                    writer.write_all(line_content.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    header_written = true;
+                }
+            } else {
+                if seen_lines.insert(line_content.clone()) {
+                    writer.write_all(line_content.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                }
+            }
+
+            // Actualizar progreso cada 1000 líneas
+            if processed_lines % 1000 == 0 {
+                progress.update(processed_lines);
+            }
+        }
+    }
+
+    writer.flush()?;
+    progress.finish(&format!("🔄 Merge completado, {} registros únicos guardados en {}", seen_lines.len(), output_file));
+    Ok(())
+}
+
+fn count_lines_with_progress(input_file: &str, progress: &mut ProgressTracker, processed_lines: &mut usize) -> Result<usize, Box<dyn Error>> {
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+    let mut line_count = 0;
+
+    for _line in reader.lines() {
+        line_count += 1;
+        *processed_lines += 1;
+        
+        // Actualizar progreso cada 1000 líneas para mejor rendimiento
+        if line_count % 1000 == 0 {
+            progress.update(*processed_lines);
+        }
+    }
+    
+    progress.update(*processed_lines);
+    Ok(line_count)
+}
+
+fn count_lines(input_file: &str) -> Result<usize, Box<dyn Error>> {
+
+    print!("Counting lines in file: {}...", input_file);
+    let start = Instant::now();
+    let file = File::open(input_file).expect("Failed to open file");
+    let reader = BufReader::new(file);
+
+    let line_count = reader.lines().count();
+
+    let _ = start.elapsed().as_secs_f64();
+    println!("Time taken to count {} lines: {:.2} seconds",line_count, start.elapsed().as_secs_f64());
+
+    Ok(line_count)
+}
+
+fn has_duplicate_header(file_path: &str) -> Result<bool, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let mut reader = BufReader::new(file);
+    let mut result = false;
+
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line)? == 0 {
+        result = false; // Empty file, no duplicates
+    }
+
+    let header = first_line.trim_end().to_string();
+    let mut line_number = 1;
+
+    for line in reader.lines() {
+        line_number += 1;
+        let line = line?;
+        if line.trim_end() == header {
+            println!("Duplicate header found on line {}", line_number);
+            result = true;
+        }
+    }
+
+    Ok(result)
+}
+
+fn clean_headers(input_file: &str, output_file: &str) -> Result<(), Box<dyn Error>> {
+    let input = File::open(input_file)?;
+    let reader = BufReader::new(input);
+    let output = File::create(output_file)?;
+    let mut writer = BufWriter::new(output);
+
+    let mut first_line = String::new();
+    let mut lines = reader.lines();
+
+    if let Some(Ok(header)) = lines.next() {
+        first_line = header;
+        writer.write_all(first_line.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+
+    for line in lines {
+        let line = line?;
+        if line != first_line {
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+    }
+
+    writer.flush()?;
+    println!("Header cleanup complete.");
+    Ok(())
+}
+
+fn filter_rows(input_file: &str, output_file: &str, column_name: &str, value: &str) -> Result<(), Box<dyn Error>> {
+    let input = File::open(input_file)?;
+    let reader = BufReader::new(input);
+    let output = File::create(output_file)?;
+    let mut writer = WriterBuilder::new().has_headers(true).from_writer(BufWriter::new(output));
+
+    let mut rdr = csv::Reader::from_reader(reader);
+    let headers = rdr.headers()?.clone();
+    writer.write_record(headers.iter())?;
+
+    let column_index = headers.iter().position(|h| h == column_name).ok_or_else(|| {
+        format!("Column '{}' not found in input file", column_name)
+    })?;
+
+    for result in rdr.records() {
+        let record = result?;
+        if record.get(column_index).unwrap_or("") == value {
+            writer.write_record(&record)?;
+        }
+    }
+
+    writer.flush()?;
+    println!("Row filtering complete.");
+    Ok(())
+}
+
+fn compare_first_n(file1: &str, file2: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    let f1 = File::open(file1)?;
+    let f2 = File::open(file2)?;
+    let reader1 = BufReader::new(f1);
+    let reader2 = BufReader::new(f2);
+
+    let mut lines1 = reader1.lines();
+    let mut lines2 = reader2.lines();
+
+    let header1 = lines1.next().unwrap_or(Ok(String::new()))?;
+    let header2 = lines2.next().unwrap_or(Ok(String::new()))?;
+
+    if header1 != header2 {
+        println!("⚠️ Header mismatch!");
+        println!("File1 header: {}", header1);
+        println!("File2 header: {}", header2);
+    } else {
+        println!("✅ Headers match.");
+    }
+
+    println!("Comparing first {} data rows...", num_rows);
+
+    let mut differences = 0;
+
+    for i in 1..=num_rows {
+        let line1 = lines1.next().unwrap_or(Ok(String::new()))?;
+        let line2 = lines2.next().unwrap_or(Ok(String::new()))?;
+
+        if line1 != line2 {
+            println!("❌ Difference at line {}:", i + 1);
+            println!("File1: {}", line1);
+            println!("File2: {}", line2);
+            differences += 1;
+        }
+    }
+
+    if differences == 0 {
+        println!("🎉 No differences found in the first {} rows.", num_rows);
+    } else {
+        println!("🔍 Found {} differences in the first {} rows.", differences, num_rows);
+    }
+
+    Ok(())
+}
+
+fn tail_csv(input_file: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    use std::collections::VecDeque;
+
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+
+    let mut lines = reader.lines();
+    let header = lines.next().unwrap_or(Ok(String::new()))?;
+    let mut buffer = VecDeque::with_capacity(num_rows);
+
+    for line in lines {
+        let line = line?;
+        if buffer.len() == num_rows {
+            buffer.pop_front();
+        }
+        buffer.push_back(line);
+    }
+
+    println!("{}", header);
+    for line in buffer {
+        println!("{}", line);
+    }
+
+    Ok(())
+}
+
+/// Muestra las primeras N filas de un CSV (optimizado para archivos gigantes)
+fn head_csv(input_file: &str, num_rows: usize) -> Result<(), Box<dyn Error>> {
+    let file = File::open(input_file)?;
+    let reader = BufReader::new(file);
+    
+    let mut lines = reader.lines();
+    
+    // Mostrar header
+    if let Some(Ok(header)) = lines.next() {
+        println!("{}", header);
+    } else {
+        println!("❌ Archivo vacío o sin header");
+        return Ok(());
+    }
+    
+    // Mostrar N filas de datos
+    let mut count = 0;
+    for line in lines {
+        if count >= num_rows {
+            break;
+        }
+        println!("{}", line?);
+        count += 1;
+    }
+    
+    println!("\n📊 Mostrando {} de las primeras {} filas de datos", count, num_rows);
+    
+    Ok(())
+}
+
+/// Enum para seleccionar el modelo según el nombre de la tabla DynamoDB
+pub enum DynamoModel {
+    SiisaMorosos,
+    // Aquí puedes agregar otros modelos en el futuro
+}
+
+/// Valida un CSV contra el modelo especificado por nombre de tabla DynamoDB.
+/// Guarda los errores en un archivo de texto.
+pub fn validate_csv_schema_with_model(
+    input_file: &str,
+    error_file: &str,
+    model: DynamoModel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    let file = File::open(input_file)?;
+    let mut rdr = csv::Reader::from_reader(file);
+    let mut error_writer = BufWriter::new(File::create(error_file)?);
+    let mut line_number = 2;
+    let mut error_count = 0;
+
+    match model {
+        DynamoModel::SiisaMorosos => {
+            for result in rdr.deserialize::<MorososTransmitDynamoDbModel>() {
+                match result {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = format!("Error en línea {}: {}\n", line_number, e);
+                        print!("{}", msg);
+                        error_writer.write_all(msg.as_bytes())?;
+                        error_count += 1;
+                    }
+                }
+                line_number += 1;
+            }
+        }
+        // Aquí puedes agregar otros modelos usando else if o match adicional
+        // DynamoModel::OtroModelo => { ... }
+    }
+
+    error_writer.flush()?;
+    println!(
+        "Validación completada. Total de errores: {}. Detalles en '{}'",
+        error_count, error_file
+    );
+    Ok(())
+}
+
+fn help() {
+    println!("Available commands:");
+    println!("  clean: Clean duplicate headers from a CSV file.");
+    println!("      Usage: csv_tool clean <input_file> <output_file>");
+    println!("  filter: Filter rows based on a column value.");
+    println!("      Usage: csv_tool filter <input_file> <output_file> <column_name> <value>");
+    println!("  check: Enhanced check for headers (duplicates + missing detection).");
+    println!("      Usage: csv_tool check <input_file> [model_type]");
+    println!("      - <model_type>: Optional model validation (e.g., 'siisa_morosos')");
+    println!("  count: Count the number of lines in a CSV file.");
+    println!("      Usage: csv_tool count <input_file>");
+    println!("  count_all: Count lines in multiple files listed in a text file.");
+    println!("      Usage: csv_tool count_all <file_list>");
+    println!("  count_unique: Count unique records across multiple files (fast, but needs RAM).");
+    println!("      Usage: csv_tool count_unique <file_list>");
+    println!("  merge_dedup: Merge multiple CSV files and remove duplicates (in-memory).");
+    println!("      Usage: csv_tool merge_dedup <file_list> <output_file>");
+    println!("  external_dedup: Merge and deduplicate using external sort (for HUGE files).");
+    println!("      Usage: csv_tool external_dedup <file_list> <output_file>");
+    println!("  estimate_memory: Estimate RAM needed for in-memory deduplication.");
+    println!("      Usage: csv_tool estimate_memory <file_list>");
+    println!("  compare: Compare first N rows of two CSV files.");
+    println!("      Usage: csv_tool compare <file1> <file2> <num_rows>");
+    println!("  tail: Show the last N rows of a CSV file.");
+    println!("      Usage: csv_tool tail <input_file> <num_rows>");
+    println!("  merge: Merge multiple CSV files (no deduplication).");
+    println!("      Usage: csv_tool merge <file_list> <output_file>");
+    println!();
+    println!("📋 VALIDATION & CLEANING COMMANDS:");
+    println!("  validate_model: Validate a CSV file against a DynamoDB model schema with progress bar.");
+    println!("      Usage: csv_tool validate_model <input_file> <error_file> <dynamo_table> <max_errors_to_show> <cancel_on_max_errors>");
+    println!("      - <input_file>: CSV file to validate");
+    println!("      - <error_file>: Output file for error details");
+    println!("      - <dynamo_table>: DynamoDB table/model name (e.g. siisa_morosos)");
+    println!("      - <max_errors_to_show>: Show up to N errors on screen (integer)");
+    println!("      - <cancel_on_max_errors>: true/false, if true cancels after showing N errors");
+    println!("  clean_invalid_lines: Genera una copia del CSV solo con líneas válidas (columnas correctas).");
+    println!("      Usage: csv_tool clean_invalid_lines <input_file> <output_file> <error_file>");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV de salida solo con líneas válidas");
+    println!("      - <error_file>: Archivo de texto con detalles de las líneas eliminadas");
+    println!();
+    println!("🔍 INSPECTION & DIAGNOSTIC COMMANDS:");
+    println!("  inspect_line: Inspecciona una línea específica en el CSV, mostrando contexto alrededor.");
+    println!("      Usage: csv_tool inspect_line <input_file> <line_number> [context]");
+    println!("      - <input_file>: Archivo CSV a inspeccionar");
+    println!("      - <line_number>: Número de línea a inspeccionar (1-based)");
+    println!("      - <context>: Número de líneas de contexto a mostrar antes y después (opcional, por defecto 5)");
+    println!("  find_missing_key: Busca claves faltantes en una columna específica del CSV.");
+    println!("      Usage: csv_tool find_missing_key <input_file> <key_column> [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <key_column>: Nombre de la columna clave a verificar");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 100)");
+    println!("  find_oversize: Encuentra líneas que exceden un tamaño umbral en bytes.");
+    println!("      Usage: csv_tool find_oversize <input_file> [threshold_bytes] [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <threshold_bytes>: Tamaño umbral en bytes (opcional, por defecto 350000)");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 10)");
+    println!("  find_invalid_numeric: Busca valores numéricos inválidos en columnas específicas.");
+    println!("      Usage: csv_tool find_invalid_numeric <input_file> <col1,col2,...> [max_report]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <col1,col2,...>: Nombres de las columnas a verificar, separadas por comas");
+    println!("      - <max_report>: Número máximo de reportes a mostrar (opcional, por defecto 100)");
+    println!();
+    println!("🔧 HEADER MANAGEMENT COMMANDS:");
+    println!("  detect_missing_header: Detecta si falta el header en el archivo CSV.");
+    println!("      Usage: csv_tool detect_missing_header <input_file> [expected_header]");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <expected_header>: Opcional, patrón esperado del header (para validación específica)");
+    println!("      - Returns exit code 1 if header is missing (useful for scripts)");
+    println!("  add_header: Agrega un header faltante a un archivo CSV basado en el tipo de modelo.");
+    println!("      Usage: csv_tool add_header <input_file> <output_file> <model_type> [validate]");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV de salida con el header agregado");
+    println!("      - <model_type>: Tipo de modelo (ej. siisa_morosos) para determinar el header esperado");
+    println!("      - <validate>: Opcional, 'true' para validar los datos después de agregar el header");
+    println!("  batch_add_headers: Agrega headers a múltiples archivos CSV listados en un archivo de texto.");
+    println!("      Usage: csv_tool batch_add_headers <file_list.txt> <model_type> <output_dir>");
+    println!("      - <file_list.txt>: Archivo de texto con la lista de archivos CSV");
+    println!("      - <model_type>: Tipo de modelo para el header (ej. siisa_morosos)");
+    println!("      - <output_dir>: Directorio de salida para los archivos CSV con header agregado");
+    println!();
+    println!("📅 DATE OPERATIONS COMMANDS:");
+    println!("  sort_by_date: Ordena un CSV gigante por columna de fecha (external sort para bajo uso de RAM).");
+    println!("      Usage: csv_tool sort_by_date <input_file> <output_file> <date_column> [asc|desc]");
+    println!("      - <input_file>: Archivo CSV de entrada");
+    println!("      - <output_file>: Archivo CSV ordenado de salida");
+    println!("      - <date_column>: Nombre de la columna de fecha (ej. CreateDate)");
+    println!("      - [asc|desc]: Orden ascendente (más antiguo primero) o descendente (más reciente primero), por defecto 'desc'");
+    println!("      - Formato de fecha soportado: MM/dd/yyyy hh:mm:ss AM/PM (ej. 8/13/2025 11:00:00 AM)");
+    println!("  find_oldest_date: Encuentra la fecha más antigua en un CSV gigante (escaneo lineal O(n), bajo uso de RAM).");
+    println!("      Usage: csv_tool find_oldest_date <input_file> <date_column>");
+    println!("      - Escanea todo el archivo sin ordenar completo");
+    println!("      - Continúa procesando ante errores de formato");
+    println!("      - Muestra progreso en tiempo real cada 100k registros");
+    println!("  find_newest_date: Encuentra la fecha más reciente en un CSV gigante.");
+    println!("      Usage: csv_tool find_newest_date <input_file> <date_column>");
+    println!("      - Mismo comportamiento que find_oldest_date pero busca la más reciente");
+    println!("  find_last_by_month: Encuentra el último registro (fecha más reciente) de un mes/año específico.");
+    println!("      Usage: csv_tool find_last_by_month <input_file> <date_column> <year> <month>");
+    println!("      - <input_file>: Archivo CSV a analizar");
+    println!("      - <date_column>: Nombre de la columna de fecha (ej. CreateDate)");
+    println!("      - <year>: Año a buscar (ej. 2025)");
+    println!("      - <month>: Mes a buscar (1-12)");
+    println!("      - Si no encuentra coincidencias exactas, muestra el registro más cercano temporalmente");
+    println!("      - Calcula distancia en días antes/después del mes objetivo");
+    println!("      Example: csv_tool find_last_by_month data.csv CreateDate 2025 8");
+    println!();
+    println!("💡 TIPS:");
+    println!("  - Para archivos >100M registros, usar comandos de fecha sin contar líneas primero");
+    println!("  - Los comandos de fecha ignoran errores de formato y continúan procesando");
+    println!("  - Usar external_dedup para archivos que requieren >16GB RAM para merge_dedup");
+    println!("  - Todos los comandos de fecha muestran progreso en tiempo real");
+    println!("  - find_last_by_month es útil para análisis de datos mensuales sin ordenar todo el dataset");
+}

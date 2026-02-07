@@ -1,242 +1,131 @@
 # CSV Tools - Herramientas de Procesamiento CSV
 
-🛠️ **Suite de herramientas para procesamiento, análisis y conversión de archivos CSV**
+🛠️ Suite de utilidades para inspección, limpieza y análisis de CSV a gran escala (orientado a SIISA).
 
-## 📋 Descripción
+## Resumen rápido
+- Implementado en Rust (alto rendimiento).
+- Diseñado para trabajar con archivos de millones de filas en streaming (sin cargar todo en memoria).
+- Integración directa con SiisaRestApi.Process para depuración de migraciones.
 
-CSV Tools es una colección de herramientas desarrolladas en **Rust** y **Python** para el procesamiento eficiente de archivos CSV de gran tamaño.
+## Instalación / Build
 
-## 🚀 Características Principales
+Requisitos:
+- Rust toolchain
 
-- ✅ **Alto rendimiento** con Rust para archivos de millones de registros
-- ✅ **Procesamiento por chunks** para archivos que no caben en memoria
-- ✅ **Deduplicación inteligente** preservando headers
-- ✅ **Análisis de integridad** y detección de headers duplicados
-- ✅ **Comparación de archivos** con reportes detallados
-- ✅ **Filtrado y limpieza** de datos
-- ✅ **Conteo rápido** de registros múltiples archivos
-
-## 📁 Estructura del Proyecto
-
-```
-csv_tools/
-├── src/
-│   ├── main.rs                    # Herramienta principal en Rust
-│   ├── decoder.rs                 # Decodificador de formatos personalizados.
-│   └── analyzer.rs                # Analizador de estructuras de datos
-├── csv_tools.py                   # Herramienta Python con Polars
-├── Cargo.toml                     # Configuración Rust
-└── README.md                      # Este archivo
-```
-
-## 🔧 Instalación
-
-### Prerrequisitos
-
-- **Rust** (para herramientas de alto rendimiento)
-- **Python 3.8+** (para herramientas de análisis)
-- **Visual Studio Build Tools** (Windows, para Rust)
-
-### Instalación de Rust
-
-```bash
-# Instalar Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# En Windows, también instalar Visual Studio Build Tools
-winget install Microsoft.VisualStudio.2022.BuildTools
-
-# En el caso de ya tener el Visual Studio 2022 en el mismo ambiente el isual Studio Build Tools ya estaria instalado
-```
-
-### Instalación de Python
-
-```bash
-# Windows
-winget install Python.Python.3.12
-
-# Instalar dependencias Python
-pip install polars
-```
-
-### Compilación de Herramientas Rust
-
-```bash
-# Compilar versión optimizada
+Compilar (optimizado):
+```powershell
+# desde el directorio csv_tools
 cargo build --release
-
-# El ejecutable estará en target/release/csv_tools.exe
+# ejecutable: target\release\csv_tools.exe
 ```
 
-## 📚 Herramientas Disponibles
-
-### 1. 🦀 **CSV Tools (Rust)** - Alto Rendimiento
-
-Herramienta principal para procesamiento intensivo de archivos CSV grandes.
-
-#### Comandos Disponibles:
-
-```bash
-# Limpiar headers duplicados
-./target/release/csv_tools.exe clean input.csv output.csv
-
-# Filtrar registros por columna
-./target/release/csv_tools.exe filter input.csv output.csv "NombreColumna" "valor"
-
-# Verificar headers duplicados
-./target/release/csv_tools.exe check input.csv
-
-# Contar líneas rápidamente
-./target/release/csv_tools.exe count input.csv
-
-# Contar líneas en múltiples archivos (TOTAL, incluye duplicados)
-./target/release/csv_tools.exe count_all file_list.txt
-
-# Contar registros únicos en múltiples archivos (RÁPIDO, pero requiere RAM)
-./target/release/csv_tools.exe count_unique file_list.txt
-
-# Merge y deduplicación in-memory (RÁPIDO, pero limitado por RAM)
-./target/release/csv_tools.exe merge_dedup file_list.txt output.csv
-
-# 🆕 ESTIMAR memoria necesaria antes de procesar (RECOMENDADO)
-./target/release/csv_tools.exe estimate_memory file_list.txt
-
-# 🆕 DEDUPLICACIÓN EXTERNA para archivos GIGANTES (sin límite de RAM)
-./target/release/csv_tools.exe external_dedup file_list.txt output.csv
-
-# Comparar archivos
-./target/release/csv_tools.exe compare file1.csv file2.csv 100
-
-# Ayuda
-./target/release/csv_tools.exe help
+Recomendado en Cargo.toml:
+```toml
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
 ```
 
-#### 🚨 **Guía de Comandos según Tamaño de Datos:**
+## Comandos principales (Rust)
 
-```bash
-# Para archivos < 10M registros únicos (< 2GB RAM)
-./target/release/csv_tools.exe count_unique file_list.txt
-./target/release/csv_tools.exe merge_dedup file_list.txt output.csv
+- clean <input> <output>
+- filter <input> <output> <col> <value>
+- check <input> <model>
+- count <input>
+- count_all <file_list.txt>
+- count_unique <file_list.txt>
+- merge_dedup <file_list.txt> <output.csv>
+- external_dedup <file_list.txt> <output.csv>
+  - Recomendado para archivos gigantes (decenas de GB), usa herramientas externas para ordenar/deduplicar con poco uso de RAM.
 
-# Para archivos 10M-50M registros únicos (2-10GB RAM)
-./target/release/csv_tools.exe estimate_memory file_list.txt  # ⚠️ Verificar primero
-./target/release/csv_tools.exe count_unique file_list.txt     # Si RAM es suficiente
+Nuevos comandos útiles
+- tail <input> <num_rows>
+  - Muestra las últimas N filas del CSV (conserva el header).
+  - Ejemplo: .\target\release\csv_tools.exe tail "C:\data\siisa.csv" 50
+- find_latest_date <input> <date_column> [mdy|iso]
+  - Encuentra la fecha más reciente en una columna dada.
+  - Formatos soportados:
+    - mdy (default): "8/13/2025 11:00:00", "8/13/2025", y variantes tipo "1,8/13/2025 11:00:00" (elimina coma).
+    - iso: "2025-08-13 11:00:00", "2025-08-13T11:00:00", "2025-08-13".
+  - Ejemplo: .\target\release\csv_tools.exe find_latest_date ".\siisa.csv" CreateDate mdy
+- find_latest_date_batch <file_list.txt> <date_column> [mdy|iso]
+  - Busca la fecha más reciente entre múltiples CSV listados (uno por línea) en file_list.txt.
+  - Ejemplo: .\target\release\csv_tools.exe find_latest_date_batch ".\file_list.txt" CreateDate mdy
+- find_earliest_date_batch <file_list.txt> <date_column> [mdy|iso]
+  - Busca la fecha más antigua por archivo y la más antigua global en el conjunto.
+  - Ejemplo: .\target\release\csv_tools.exe find_earliest_date_batch ".\file_list.txt" CreateDate mdy
+- merge_dedup_mixed <file_list.txt> <output.csv> [expected_header]
+  - Une múltiples CSV con y sin header manteniendo un único header en la salida y eliminando duplicados.
+  - Si pasas expected_header, se usará como header único; si no, detecta el primero y lo conserva.
+  - Ejemplo:
+    .\target\release\csv_tools.exe merge_dedup_mixed ".\file_list.txt" ".\merged.csv" "Cuil,NroDoc,ApellidoNombre,IdCliente,IdRegion,RazonSocial,Telefono,NombreRegion,NombreCategoria,Periodo,IdEntidad,CreateDate,CreateUser"
+- sort_by_date <input> <output> <date_column> [asc|desc]
+  - Ordena un CSV gigante por fecha usando external sort (bajo uso de RAM).
+  - Formato soportado: MM/dd/yyyy hh:mm:ss AM/PM (ej. 8/13/2025 11:00:00 AM).
+  - También soporta formatos ISO y variantes.
+  - Ejemplo ASC: .\target\release\csv_tools.exe sort_by_date ".\siisa.csv" ".\siisa_sorted.csv" CreateDate asc
+  - Ejemplo DESC: .\target\release\csv_tools.exe sort_by_date ".\siisa.csv" ".\siisa_sorted_desc.csv" CreateDate desc
 
-# Para archivos 50M+ registros únicos (>10GB RAM requerida)
-./target/release/csv_tools.exe external_dedup file_list.txt output.csv  # 🔥 Siempre funciona
+## Ejemplos (PowerShell)
+
+```powershell
+# Contar filas
+.\target\release\csv_tools.exe count ".\data\siisa.csv"
+
+# Merge con deduplicación (archivos muy grandes: usa external_dedup)
+.\target\release\csv_tools.exe external_dedup ".\file_list.txt" ".\merged.csv"
+
+# Últimas 100 filas
+.\target\release\csv_tools.exe tail ".\data\siisa.csv" 100
+
+# Fecha más reciente en un archivo
+.\target\release\csv_tools.exe find_latest_date ".\data\siisa.csv" CreateDate mdy
+
+# Fecha más reciente entre muchos archivos
+.\target\release\csv_tools.exe find_latest_date_batch ".\file_list.txt" CreateDate mdy
+
+# Fecha más antigua por archivo y global
+.\target\release\csv_tools.exe find_earliest_date_batch ".\file_list.txt" CreateDate mdy
+
+# Merge de archivos con/sin header (mismo modelo)
+.\target\release\csv_tools.exe merge_dedup_mixed ".\file_list.txt" ".\out.csv" "Cuil,NroDoc,ApellidoNombre,IdCliente,IdRegion,RazonSocial,Telefono,NombreRegion,NombreCategoria,Periodo,IdEntidad,CreateDate,CreateUser"
+
+# Ordenar por fecha (ascendente)
+.\target\release\csv_tools.exe sort_by_date ".\data\siisa.csv" ".\siisa_sorted.csv" CreateDate asc
+
+# Ordenar por fecha (descendente)
+.\target\release\csv_tools.exe sort_by_date ".\data\siisa.csv" ".\siisa_sorted_desc.csv" CreateDate desc
 ```
 
-#### Ejemplo de Uso:
+## Consejos de rendimiento (50M+ filas)
+- Siempre compilar en release: cargo run --release -- <comando> ...
+- Coloca los CSV en SSD NVMe para maximizar I/O.
+- Usa external_dedup para uniones enormes (bajo uso de memoria).
+- Evita imprimir demasiado en consola (los comandos ya limitan logs).
+- Usa rutas absolutas en file_list.txt para evitar “NotFound”.
+- Si usas formato mdy/iso, especifica uno para reducir intentos de parseo.
 
-```bash
-# Procesar archivo de 1M de registros
-./target/release/csv_tools.exe count big_file.csv
-# Output: Counting lines in file: big_file.csv...
-#         Time taken to count 1000000 lines: 0.45 seconds
+## Solución de problemas
 
-# Merge multiple files with deduplication
-./target/release/csv_tools.exe merge_dedup chunks_list.txt merged_output.csv
-# Output: Merge completado, duplicados eliminados.
-```
+- “The system cannot find the file specified.” al usar find_*_batch:
+  - Ejecuta desde el mismo directorio donde está file_list.txt, o usa ruta absoluta.
+  - Asegúrate de que cada línea de file_list.txt apunte a un archivo existente (puedes probar con Get-Item en PowerShell).
+- Archivos sin header en merge:
+  - Usa merge_dedup_mixed y, si es posible, pasa expected_header para evitar que la primera línea de un archivo sin header sea tomada como header.
 
-### 2. 🐍 **CSV Tools (Python)** - Análisis Avanzado
+## Integración con SiisaRestApi.Process
+- Use csv_tools para preparar/validar el CSV antes de subir a S3.
+- Flujo recomendado antes de migrate:
+  1. Verificar que el archivo .gz esté en S3 (aws s3 ls).
+  2. Ejecutar los checks sobre el CSV local.
+  3. Subir archivo limpio a S3 y luego lanzar SiisaRestApi.Process.exe --step=migrate.
 
-Herramienta Python con Polars para análisis más flexibles.
+## Contacto / Repo
+- Equipo SiisaRestApi Development
+- Repo: https://github.com/SIISAPosta/SiisaRestApi
 
-```bash
-# Usar con Python
-python csv_tools.py clean input.csv output.csv
-python csv_tools.py filter input.csv output.csv "columna" "valor"
-python csv_tools.py count input.csv
-python csv_tools.py merge_dedup file_list.txt output.csv
-```
-
-## 🎯 Casos de Uso Específicos
-
-### Análisis de Calidad de Datos
-
-```bash
-# Verificar headers duplicados (problema común en exports)
-./target/release/csv_tools.exe check exported_data.csv
-
-# Comparar archivos para detectar diferencias
-./target/release/csv_tools.exe compare original.csv processed.csv 1000
-
-# Filtrar registros específicos
-./target/release/csv_tools.exe filter data.csv filtered.csv "IdCliente" "123"
-```
-
-## 📊 Rendimiento
-
-### Benchmarks Típicos
-
-| Operación | Archivo | Tiempo (Rust) | Tiempo (Python) | Notas |
-|-----------|---------|---------------|-----------------|-------|
-| Count | 1M registros | 0.45s | 2.3s | Archivo individual |
-| Count All | 5 archivos x 200K | 1.8s | 5.2s | **Total con duplicados** |
-| Count Unique | 5 archivos x 200K | 2.4s | N/A | **Solo únicos, rápido** |
-| Count Unique | 2.25M registros | 1.8s | N/A | **Límite práctico in-memory** |
-| **External Dedup** | **358M registros** | **~2-5 min** | **N/A** | **🔥 Sin límite de RAM** |
-| Clean Headers | 500K registros | 1.2s | 3.8s | Limpieza de headers |
-| Merge + Dedup | 5 archivos x 200K | 3.4s | 12.1s | **Genera archivo output** |
-| Filter | 1M registros | 2.1s | 4.7s | Filtrado por columna |
-
-### 🧠 **Límites de Memoria**
-
-| Registros Únicos | RAM Estimada | Comando Recomendado | Notas |
-|------------------|--------------|---------------------|-------|
-| < 1M | < 500MB | `count_unique` | ✅ Súper rápido |
-| 1M - 5M | 500MB - 2GB | `count_unique` | ✅ Rápido |
-| 5M - 25M | 2GB - 10GB | `estimate_memory` + `count_unique` | ⚠️ Verificar RAM |
-| 25M - 100M+ | 10GB - 40GB+ | `external_dedup` | 🔥 **Usar siempre** |
-| 100M+ | 40GB+ | `external_dedup` | 🚀 **Unlimited scale** |
-
-**💡 Recomendación**: Usar herramientas Rust para archivos > 100K registros
-
-## 🔍 Formatos Soportados
-
-### CSV Estándar
-- Headers automáticos
-- Separadores: coma, punto y coma, tab
-- Encoding: UTF-8, UTF-16, ISO-8859-1
-
-
-## 🛡️ Validaciones y Controles
-
-- ✅ **Verificación de headers** duplicados
-- ✅ **Validación de estructura** de archivos
-- ✅ **Detección de encoding** automática
-- ✅ **Manejo de errores** robusto
-- ✅ **Reportes detallados** de procesamiento
-- ✅ **Preservación de datos** originales
-
-## 🚨 Limitaciones Conocidas
-
-1. **Memoria**: Archivos > 10GB requieren procesamiento por chunks
-2. **Encoding**: Algunos archivos legacy pueden requerir conversión manual
-3. **Headers**: Se asume que la primera línea es header
-4. **Python**: Requiere instalación de Polars para funcionalidad completa
-
-## 🆘 Soporte y Troubleshooting
-
-### Problemas Comunes
-
-**Error: "linker link.exe not found"**
-```bash
-# Instalar Visual Studio Build Tools
-winget install Microsoft.VisualStudio.2022.BuildTools
-```
-
-**Error: "Python module polars not found"**
-```bash
-pip install polars
-```
-
-**Archivos muy grandes causing memory issues**
-```bash
-# Usar herramientas Rust en lugar de Python
-./target/release/csv_tools.exe count huge_file.csv
-```
 ---
 
-**⚡ Optimizado para el procesamiento de millones de registros**
+**⚡ Optimizado para el procesamiento de millones de registros del sistema SIISA**
